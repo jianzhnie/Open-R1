@@ -118,7 +118,9 @@ def load_model_tokenizer(
         **config_kwargs,
     )
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token = tokenizer.unk_token
+    elif tokenizer.pad_token != tokenizer.unk_token:
+        tokenizer.pad_token = tokenizer.unk_token
 
     # Enable model parallelism
     setattr(model, 'model_parallel', True)
@@ -193,33 +195,6 @@ def train() -> None:
         data_collator=data_collator,
         **dataset_module,
     )
-    if list(pathlib.Path(training_args.output_dir).glob('checkpoint-*')):
-        trainer.train(resume_from_checkpoint=True)
-    else:
-        trainer.train()
-
-    # Training
-    if training_args.do_train:
-        if (list(pathlib.Path(training_args.output_dir).glob('checkpoint-*'))
-                and training_args.resume_from_checkpoint):
-            logger.info('Resuming training from checkpoint %s' %
-                        (training_args.resume_from_checkpoint))
-            train_result = trainer.train(
-                resume_from_checkpoint=training_args.resume_from_checkpoint)
-        else:
-            logger.info('Starting training from scratch...')
-            train_result = trainer.train()
-
-        trainer.log_metrics('train', train_result.metrics)
-        trainer.save_metrics('train', train_result.metrics)
-
-        # Save model
-        model.config.use_cache = True
-        trainer.save_state()
-        if trainer.is_deepspeed_enabled:
-            trainer.save_model()
-        else:
-            trainer_save_model_safe(trainer)
 
     # Training
     if training_args.do_train:
