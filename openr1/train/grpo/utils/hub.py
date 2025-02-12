@@ -1,17 +1,3 @@
-#!/usr/bin/env python
-# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 import re
@@ -22,7 +8,9 @@ from huggingface_hub import (create_branch, create_repo,
                              list_repo_files, list_repo_refs, repo_exists,
                              upload_folder)
 from transformers import AutoConfig
-from trl import GRPOConfig, SFTConfig
+from trl import SFTConfig
+
+from openr1.train.grpo.grpo_config import GRPOConfig
 
 logger = logging.getLogger(__name__)
 
@@ -77,8 +65,12 @@ def check_hub_revision_exists(training_args: SFTConfig | GRPOConfig):
             if training_args.hub_model_revision in revisions:
                 repo_files = list_repo_files(
                     repo_id=training_args.hub_model_id,
-                    revision=training_args.hub_model_revision)
-                if 'README.md' in repo_files and training_args.overwrite_hub_revision is False:
+                    revision=training_args.hub_model_revision,
+                )
+                if (
+                    "README.md" in repo_files
+                    and training_args.overwrite_hub_revision is False
+                ):
                     raise ValueError(
                         f'Revision {training_args.hub_model_revision} already exists. '
                         'Use --overwrite_hub_revision to overwrite it.')
