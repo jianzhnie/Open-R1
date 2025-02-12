@@ -1,5 +1,4 @@
 import os
-import sys
 import textwrap
 import warnings
 from collections import defaultdict
@@ -29,12 +28,11 @@ from trl.import_utils import is_vllm_available
 from trl.models import (create_reference_model, prepare_deepspeed,
                         unwrap_model_for_generation)
 from trl.trainer.callbacks import SyncRefModelCallback
-from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.utils import (generate_model_card, get_comet_experiment_url,
                                pad)
 
-sys.path.append(os.getcwd())
-from openr1.train.grpo.utils import selective_log_softmax
+from openr1.train.grpo.grpo_config import GRPOConfig
+from openr1.utils.utils import selective_log_softmax
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
@@ -202,8 +200,8 @@ class GRPOTrainer(Trainer):
         if isinstance(model, str):
             model_id = model
             torch_dtype = model_init_kwargs.get('torch_dtype')
-            if isinstance(torch_dtype, torch.dtype
-                          ) or torch_dtype == 'auto' or torch_dtype is None:
+            if (isinstance(torch_dtype, torch.dtype) or torch_dtype == 'auto'
+                    or torch_dtype is None):
                 pass  # torch_dtype is already a torch.dtype or "auto" or None
             elif isinstance(torch_dtype, str):  # it's a str, but not "auto"
                 torch_dtype = getattr(torch, torch_dtype)
@@ -275,7 +273,8 @@ class GRPOTrainer(Trainer):
                     reward_processing_class = AutoTokenizer.from_pretrained(
                         reward_func.config._name_or_path)
                 if reward_processing_class.pad_token_id is None:
-                    reward_processing_class.pad_token = reward_processing_class.eos_token
+                    reward_processing_class.pad_token = (
+                        reward_processing_class.eos_token)
                 # The reward model computes the reward for the latest non-padded token in the input sequence.
                 # So it's important to set the pad token ID to the padding token ID of the processing class.
                 reward_func.config.pad_token_id = reward_processing_class.pad_token_id
@@ -288,7 +287,8 @@ class GRPOTrainer(Trainer):
 
         # Training arguments
         self.max_prompt_length = args.max_prompt_length
-        self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
+        self.max_completion_length = (args.max_completion_length
+                                      )  # = |o_i| in the GRPO paper
         self.num_generations = args.num_generations  # = G in the GRPO paper
         self.use_vllm = args.use_vllm
 
@@ -353,19 +353,23 @@ class GRPOTrainer(Trainer):
                 vllm_device = self.args.vllm_device
                 device_type = PartialState().default_device.type
                 device_module = getattr(torch, device_type)
+                device_count = device_module.device_count()
+                print(
+                    f'device_type-{device_type}, device_count-{device_count}, device_module-{device_module}'
+                )
                 if vllm_device == 'auto':
                     vllm_device = f'{device_type}:{self.accelerator.num_processes}'  # take the next GPU idx
                     self.args.vllm_device = vllm_device
+                    print(f'vllm_device-{vllm_device}')
                 # Check that the requested device is available
-                device_verify = int(
-                    vllm_device.split(':')[1]) >= device_module.device_count()
+                device_verify = int(vllm_device.split(':')[1]) >= device_count
                 if vllm_device.split(
                         ':')[0] == f'{device_type}' and device_verify:
                     raise ValueError(
                         f'The requested device for vllm ({vllm_device}) is not available. You are likely using vLLM '
                         'without restricting the number of GPUs for training. Set the `--num_processes` argument to a '
                         'value lower than the number of GPUs available on your machine—typically, reducing it by one '
-                        f'is sufficient. In your case: `--num_processes {device_module.device_count() - 1}`.'
+                        f'is sufficient. In your case: `--num_processes {device_count - 1}`.'
                     )
                 # Check that the requested device is not also used for training
                 if vllm_device in {
@@ -379,11 +383,14 @@ class GRPOTrainer(Trainer):
                 # vLLM is not compatible with accelerate. So we need to patch it to make sure we can (1) place the vLLM
                 # model on the desired device (world_size_patch) and (2) avoid a test that is not designed for our
                 # setting (profiling_patch).
+                word_size = torch.distributed.get_world_size
+                print(f'word_size-{word_size}')
                 world_size_patch = patch('torch.distributed.get_world_size',
                                          return_value=1)
                 profiling_patch = patch(
                     'vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling',
-                    return_value=None)
+                    return_value=None,
+                )
                 with world_size_patch, profiling_patch:
                     self.llm = LLM(
                         model=model.name_or_path,
@@ -396,7 +403,10 @@ class GRPOTrainer(Trainer):
                         # This is particularly useful here because we generate completions from the same prompts.
                         enable_prefix_caching=True,
                         max_model_len=self.args.vllm_max_model_len,
+                        enforce_eager=True,  # 禁用算子融合
+                        block_size=16,  # 减少显存块分配粒度
                     )
+
                 self.sampling_params = SamplingParams(
                     temperature=args.temperature,
                     max_tokens=self.max_completion_length,
