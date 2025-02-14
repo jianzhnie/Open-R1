@@ -1,3 +1,5 @@
+import contextlib
+import functools
 import os
 import textwrap
 import warnings
@@ -383,15 +385,31 @@ class GRPOTrainer(Trainer):
                 # vLLM is not compatible with accelerate. So we need to patch it to make sure we can (1) place the vLLM
                 # model on the desired device (world_size_patch) and (2) avoid a test that is not designed for our
                 # setting (profiling_patch).
-                word_size = torch.distributed.get_world_size
-                print(f'word_size-{word_size}')
                 world_size_patch = patch('torch.distributed.get_world_size',
                                          return_value=1)
                 profiling_patch = patch(
                     'vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling',
                     return_value=None,
                 )
-                with world_size_patch, profiling_patch:
+                # For Ascend NPU (torch-npu), collective communication requires the establishment of a communication group,
+                # and different processes must hold the same group number.  However, multiple process groups will be created
+                # internally within vLLM. This will cause the group id of the communication group on rank 0 to be different from
+                # that of other ranks, causing backward to hang on because the communication domain cannot be established. So
+                # we need to patch it to make sure the group id of different ranks in the training phase are the same.
+
+                @contextlib.contextmanager
+                def new_group_context():
+                    original_new_group = torch.distributed.new_group
+                    try:
+                        torch.distributed.new_group = functools.partial(
+                            original_new_group, use_local_synchronization=True)
+                        yield
+                    finally:
+                        torch.distributed.new_group = original_new_group
+
+                new_group_patch = new_group_context(
+                ) if device_type == 'npu' else contextlib.nullcontext()
+                with world_size_patch, profiling_patch, new_group_patch:
                     self.llm = LLM(
                         model=model.name_or_path,
                         device=vllm_device,
