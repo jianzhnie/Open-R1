@@ -1,4 +1,3 @@
-
 import logging
 import re
 from concurrent.futures import Future
@@ -67,10 +66,8 @@ def check_hub_revision_exists(training_args: SFTConfig | GRPOConfig):
                     repo_id=training_args.hub_model_id,
                     revision=training_args.hub_model_revision,
                 )
-                if (
-                    "README.md" in repo_files
-                    and training_args.overwrite_hub_revision is False
-                ):
+                if ('README.md' in repo_files
+                        and training_args.overwrite_hub_revision is False):
                     raise ValueError(
                         f'Revision {training_args.hub_model_revision} already exists. '
                         'Use --overwrite_hub_revision to overwrite it.')

@@ -19,7 +19,7 @@ from openr1.train.grpo.rewards import (accuracy_reward, format_reward,
                                        get_cosine_scaled_reward,
                                        get_repetition_penalty_reward,
                                        reasoning_steps_reward)
-from openr1.train.grpo.utils.callbacks import get_callbacks
+from openr1.utils.callbacks import get_callbacks
 
 logger = logging.getLogger(__name__)
 
