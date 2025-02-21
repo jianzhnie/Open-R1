@@ -28,8 +28,8 @@ warmup_ratio: 0.1
 ## ppo param
 total_episodes: 10000
 num_ppo_epochs: 1
-num_mini_batches: 1
-local_rollout_forward_batch_size: 1
+num_mini_batches: 8
+local_rollout_forward_batch_size: 4
 missing_eos_penalty: 1.0
 
 ## eval
