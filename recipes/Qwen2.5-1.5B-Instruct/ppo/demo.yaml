@@ -1,0 +1,47 @@
+# Model arguments
+model_name_or_path: /home/ma-user/work/models/Qwen/Qwen2.5-1.5B
+model_revision: main
+torch_dtype: bfloat16
+# attn_implementation: flash_attention_2
+
+# Data training arguments
+dataset_name: /home/ma-user/work/datasets/open-r1/OpenR1-Math-220k
+dataset_config: default
+preprocessing_num_workers: 8
+packing: true
+
+# SFT trainer config
+# train
+bf16: true
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+num_train_epochs: 3
+max_seq_length: 4096
+learning_rate: 2.0e-05
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+
+# eval
+do_eval: false
+per_device_eval_batch_size: 4
+eval_strategy: "no"
+eval_steps: 100
+
+# logger settings
+log_level: info
+logging_steps: 5
+logging_strategy: steps
+report_to: tensorboard
+
+# output
+hub_model_id: Qwen2.5-1.5B-Open-R1-Distill
+hub_strategy: every_save
+push_to_hub: false
+output_dir: ./work_dir/Qwen2.5-1.5B-Base-Open-R1-Distill-OpenR1-Math-220k
+overwrite_output_dir: true
+save_strategy: steps
+save_steps: 1000
+seed: 42

@@ -1,0 +1,51 @@
+# Model arguments
+model_name_or_path: /home/robin/hf_hub/models/opt-125m
+sft_model_path: /home/robin/hf_hub/models/opt-125m
+reward_model_path: /home/robin/hf_hub/models/opt-125m
+model_revision: main
+# attn_implementation: flash_attention_2
+
+# Data training arguments
+dataset_name: /home/robin/hf_hub/datasets/text_data/AI-MO/NuminaMath-TIR
+dataset_configs: all
+preprocessing_num_workers: 8
+
+# PPO trainer config
+## train
+seed: 42
+bf16: true
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+num_train_epochs: 3
+max_seq_length: 4096
+learning_rate: 2.0e-05
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+
+## ppo param
+total_episodes: 10000
+num_ppo_epochs: 1
+num_mini_batches: 1
+local_rollout_forward_batch_size: 1
+missing_eos_penalty: 1.0
+
+## eval
+do_eval: true
+per_device_eval_batch_size: 4
+eval_strategy: "no"
+eval_steps: 100
+
+# logger settings
+log_level: info
+logging_steps: 5
+logging_strategy: steps
+report_to: tensorboard
+
+# output
+output_dir: ./work_dir/Qwen2.5-1.5B-Open-R1-GRPO
+overwrite_output_dir: true
+save_strategy: steps
+save_steps: 1000
