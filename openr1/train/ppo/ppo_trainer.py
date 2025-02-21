@@ -612,7 +612,9 @@ class PPOTrainer(Trainer):
                     dim=-1)
                 if self.args.missing_eos_penalty is not None:
                     scores[~contain_eos_token] -= self.args.missing_eos_penalty
-                # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
+                accelerator.print(
+                    f'{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}'
+                )
 
                 # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
                 response_idxs = torch.arange(responses.shape[1],
@@ -910,7 +912,6 @@ class PPOTrainer(Trainer):
         ) as unwrapped_model:
             for batch in self.eval_dataloader:
                 query = batch['input_ids']
-                query_text = batch['prompt']
                 with torch.no_grad():
                     context_length = query.shape[1]
                     query_response, _ = batch_generation(
