@@ -12,7 +12,7 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import ConcatDataset, Dataset
 from transformers import PreTrainedTokenizer
 
-from openr1.dataset.raw_datasets import (
+from openr1.dataset.utils.raw_datasets import (
     AlpacaChinese, AlpacaCoT, AlpacaDataset, AnthropicHHRLHF,
     BelleGroupDataset, CohereMiracljaqueries2212Dataset,
     CohereMiraclzhqueries2212Dataset, DahoasFullhhrlhfDataset,

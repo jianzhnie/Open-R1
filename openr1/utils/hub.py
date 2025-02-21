@@ -15,7 +15,7 @@ from openr1.train.grpo.grpo_config import GRPOConfig
 logger = logging.getLogger(__name__)
 
 
-def push_to_hub_revision(training_args: Union[SFTConfig , GRPOConfig],
+def push_to_hub_revision(training_args: Union[SFTConfig, GRPOConfig],
                          extra_ignore_patterns=[]) -> Future:
     """Pushes the model to branch on a Hub repo."""
 
@@ -52,7 +52,7 @@ def push_to_hub_revision(training_args: Union[SFTConfig , GRPOConfig],
     return future
 
 
-def check_hub_revision_exists(training_args: Union[SFTConfig , GRPOConfig]):
+def check_hub_revision_exists(training_args: Union[SFTConfig, GRPOConfig]):
     """Checks if a given Hub revision exists."""
     if repo_exists(training_args.hub_model_id):
         if training_args.push_to_hub_revision is True:

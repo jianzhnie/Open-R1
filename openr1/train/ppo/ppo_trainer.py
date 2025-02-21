@@ -26,6 +26,7 @@ from transformers.trainer_callback import (CallbackHandler, ExportableState,
                                            PrinterCallback)
 from transformers.utils import is_peft_available
 from trl.core import masked_mean, masked_whiten
+from trl.data_utils import is_conversational, maybe_apply_chat_template
 from trl.models import create_reference_model
 from trl.models.utils import unwrap_model_for_generation
 from trl.trainer.utils import (
@@ -102,9 +103,20 @@ class PPOTrainer(Trainer):
         self.processing_class = processing_class
         self.policy_model = model
 
-        # Define the collator if not provided
-        if data_collator is None:
-            data_collator = DataCollatorWithPadding(self.processing_class)
+        # Data collator
+        def data_collator(features):  # No data collation is needed in GRPO
+            return features
+
+        super().__init__(
+            model=model,
+            args=args,
+            data_collator=data_collator,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=processing_class,
+            callbacks=callbacks,
+            optimizers=optimizers,
+        )
 
         # Handle stop token settings: update policy model's generation_config to use provided stop token
         if args.stop_token and args.stop_token_id:
@@ -472,8 +484,30 @@ class PPOTrainer(Trainer):
         for update in range(1, args.num_total_batches + 1):
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)
+            prompts = [x['prompt'] for x in data]
             with torch.no_grad():
-                queries = data['input_ids'].to(device)
+                prompts_text = [
+                    maybe_apply_chat_template(example,
+                                              self.processing_class)['prompt']
+                    for example in data
+                ]
+
+                keys = [
+                    key for key in data[0]
+                    if key not in ['prompt', 'completion']
+                ]
+                extra_data = {
+                    key: [example[key] for example in data]
+                    for key in keys
+                }
+                prompt_inputs = self.processing_class(prompts_text,
+                                                      return_tensors='pt',
+                                                      padding=True,
+                                                      padding_side='left',
+                                                      add_special_tokens=False)
+                prompt_inputs = super()._prepare_inputs(prompt_inputs)
+                queries, query_mask = prompt_inputs[
+                    'input_ids'], prompt_inputs['attention_mask']
 
                 context_length = queries.shape[1]
                 responses = []
@@ -498,6 +532,15 @@ class PPOTrainer(Trainer):
 
                 for i in range(0, queries.shape[0],
                                args.local_rollout_forward_batch_size):
+
+                    prompts_batch = prompts[i:i + args.
+                                            local_rollout_forward_batch_size]
+                    reward_extra_data = {
+                        key:
+                        extra_data[key][i:i +
+                                        args.local_rollout_forward_batch_size]
+                        for key in extra_data
+                    }
                     query = queries[i:i +
                                     args.local_rollout_forward_batch_size]
                     query_response = query_responses[
@@ -548,8 +591,24 @@ class PPOTrainer(Trainer):
                     query_text = self.processing_class.batch_decode(
                         query, skip_special_tokens=True)
 
+                    if_conversation = is_conversational(data[0])
+                    if if_conversation:
+                        completions = []
+                        for prompt, completion in zip(prompts_batch,
+                                                      completions_text):
+                            bootstrap = prompt.pop()['content'] if prompt[-1][
+                                'role'] == 'assistant' else ''
+                            completions.append([{
+                                'role':
+                                'assistant',
+                                'content':
+                                bootstrap + completion
+                            }])
+                    else:
+                        completions = completions_text
+
                     # Get the reward
-                    rewards_per_func = torch.zeros(len(completions_text),
+                    rewards_per_func = torch.zeros(len(completions),
                                                    len(self.reward_funcs),
                                                    device=device)
 
@@ -565,11 +624,10 @@ class PPOTrainer(Trainer):
                                     reward_processing_class.pad_token_id,
                                     context_length)
                         else:
-
                             output_reward_func = reward_func(
                                 prompts=query_text,
-                                completions=completions_text,
-                            )
+                                completions=completions,
+                                **reward_extra_data)
                             score = torch.tensor(output_reward_func,
                                                  dtype=torch.float32,
                                                  device=device)
@@ -911,7 +969,29 @@ class PPOTrainer(Trainer):
                 gather_deepspeed3_params=self.args.ds3_gather_for_generation
         ) as unwrapped_model:
             for batch in self.eval_dataloader:
-                query = batch['input_ids']
+                prompts = [x['prompt'] for x in batch]
+                prompts_text = [
+                    maybe_apply_chat_template(example,
+                                              self.processing_class)['prompt']
+                    for example in batch
+                ]
+                keys = [
+                    key for key in batch[0]
+                    if key not in ['prompt', 'completion']
+                ]
+                extra_data = {
+                    key: [example[key] for example in batch]
+                    for key in keys
+                }
+                prompt_inputs = self.processing_class(prompts_text,
+                                                      return_tensors='pt',
+                                                      padding=True,
+                                                      padding_side='left',
+                                                      add_special_tokens=False)
+                prompt_inputs = super()._prepare_inputs(prompt_inputs)
+                query, query_mask = prompt_inputs['input_ids'], prompt_inputs[
+                    'attention_mask']
+
                 with torch.no_grad():
                     context_length = query.shape[1]
                     query_response, _ = batch_generation(
@@ -945,7 +1025,23 @@ class PPOTrainer(Trainer):
                     query_text = self.processing_class.batch_decode(
                         query, skip_special_tokens=True)
 
-                    rewards_per_func = torch.zeros(len(completions_text),
+                    if_conversation = is_conversational(batch[0])
+                    if if_conversation:
+                        completions = []
+                        for prompt, completion in zip(prompts,
+                                                      completions_text):
+                            bootstrap = prompt.pop()['content'] if prompt[-1][
+                                'role'] == 'assistant' else ''
+                            completions.append([{
+                                'role':
+                                'assistant',
+                                'content':
+                                bootstrap + completion
+                            }])
+                    else:
+                        completions = completions_text
+
+                    rewards_per_func = torch.zeros(len(completions),
                                                    len(self.reward_funcs),
                                                    device=device)
 
@@ -965,8 +1061,8 @@ class PPOTrainer(Trainer):
                             # Repeat all input columns (but "prompt" and "completion") to match the number of generations
                             output_reward_func = reward_func(
                                 prompts=query_text,
-                                completions=completions_text,
-                            )
+                                completions=completions,
+                                **extra_data)
                             score = torch.tensor(output_reward_func,
                                                  dtype=torch.float32,
                                                  device=device)

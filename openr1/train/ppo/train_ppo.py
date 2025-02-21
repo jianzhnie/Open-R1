@@ -183,14 +183,7 @@ def main(script_args: PPOScriptArguments, training_args: PPOConfig,
     # Dataset
     ################
     dataset = load_dataset(script_args.dataset_name,
-                           name=script_args.dataset_config,
-                           split=script_args.dataset_train_split)
-    eval_samples = 100
-    train_dataset = dataset.select(range(len(dataset) - eval_samples))
-    eval_dataset = dataset.select(
-        range(len(dataset) - eval_samples, len(dataset)))
-    dataset_text_field = 'prompt'
-
+                           name=script_args.dataset_config)
     # Get reward functions
     REWARD_FUNCS_REGISTRY = {
         'accuracy':
@@ -218,51 +211,34 @@ def main(script_args: PPOScriptArguments, training_args: PPOConfig,
     ]
 
     # Format into conversation
-    def make_conversation(example):
-        return {
-            'prompt': [
-                {
-                    'role': 'system',
-                    'content': SYSTEM_PROMPT
-                },
-                {
-                    'role': 'user',
-                    'content': example['problem']
-                },
-            ],
-            'solution':
-            example['solution']
-        }
+    def make_conversation(example, tokenizer):
 
-    dataset = dataset.map(make_conversation)
+        prompt = [
+            {
+                'role': 'system',
+                'content': SYSTEM_PROMPT
+            },
+            {
+                'role': 'user',
+                'content': example['problem']
+            },
+        ]
+        return {'prompt': prompt}
 
-    def prepare_dataset(dataset, tokenizer):
-        """pre-tokenize the dataset before training; only collate during
-        training."""
+    # 处理数据集 - 修复这里的调用
+    dataset = dataset.map(
+        function=make_conversation,
+        fn_kwargs={'tokenizer': tokenizer},  # 传入tokenizer参数
+        desc='Processing dataset',
+    )
+    for split in dataset:
+        if 'messages' in dataset[split].column_names:
+            dataset[split] = dataset[split].remove_columns(
+                ['messages', 'problem'])
 
-        def tokenize(element):
-            outputs = tokenizer(
-                element[dataset_text_field],
-                padding=False,
-            )
-            return {
-                'input_ids': outputs['input_ids'],
-                'prompt': element['prompt'],
-                'solution': element['solution']
-            }
-
-        return dataset.map(
-            tokenize,
-            batched=True,
-            remove_columns=dataset.column_names,
-            num_proc=training_args.dataset_num_proc,
-        )
-
-    # Compute that only on the main process for faster data processing.
-    # see: https://github.com/huggingface/trl/pull/1255
-    with PartialState().local_main_process_first():
-        train_dataset = prepare_dataset(train_dataset, tokenizer)
-        eval_dataset = prepare_dataset(eval_dataset, tokenizer)
+    # 打印处理后的样本示例
+    print('\nProcessed example:')
+    print(dataset[script_args.dataset_train_split][0])
 
     ################
     #  Initialize the PPO trainer
@@ -273,10 +249,10 @@ def main(script_args: PPOScriptArguments, training_args: PPOConfig,
         ref_model=ref_policy,
         reward_funcs=reward_funcs,
         value_model=value_model,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
+        train_dataset=dataset[script_args.dataset_train_split],
+        eval_dataset=dataset[script_args.dataset_test_split],
         processing_class=tokenizer,
-        callbacks=get_callbacks(training_args, model_args),
+        # callbacks=get_callbacks(training_args, model_args),
         peft_config=peft_config,
     )
 
@@ -290,7 +266,7 @@ def main(script_args: PPOScriptArguments, training_args: PPOConfig,
         checkpoint = training_args.resume_from_checkpoint
     elif last_checkpoint is not None:
         checkpoint = last_checkpoint
-    train_result = trainer.train(resume_from_checkpoint=checkpoint)
+    train_result = trainer.train()
     metrics = train_result.metrics
     metrics['train_samples'] = len(dataset[script_args.dataset_train_split])
     trainer.log_metrics('train', metrics)
@@ -337,6 +313,5 @@ def main(script_args: PPOScriptArguments, training_args: PPOConfig,
 
 if __name__ == '__main__':
     parser = TrlParser((PPOScriptArguments, PPOConfig, ModelConfig))
-    script_args, training_args, model_args = parser.parse_args_and_config(
-    )
+    script_args, training_args, model_args = parser.parse_args_and_config()
     main(script_args, training_args, model_args)
