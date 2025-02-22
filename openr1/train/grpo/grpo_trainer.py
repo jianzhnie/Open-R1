@@ -11,7 +11,8 @@ import torch
 import torch.utils.data
 import transformers
 from accelerate import PartialState
-from accelerate.utils import broadcast_object_list, gather, gather_object
+from accelerate.utils import (broadcast_object_list, gather, gather_object,
+                              is_peft_model, set_seed)
 from accelerate.utils.other import is_compiled_module
 from datasets import Dataset, IterableDataset
 from packaging import version
@@ -41,6 +42,7 @@ if is_peft_available():
 
 if is_vllm_available():
     from vllm import LLM, SamplingParams
+    from vllm.sampling_params import GuidedDecodingParams
 
 if is_wandb_available():
     import wandb
@@ -58,6 +60,8 @@ class RepeatRandomSampler(Sampler):
             Dataset to sample from.
         repeat_count (`int`):
             Number of times to repeat each index.
+        seed (`Optional[int]`):
+            Random seed for reproducibility (only affects this sampler).
 
     Example:
     ```python
@@ -67,14 +71,22 @@ class RepeatRandomSampler(Sampler):
     ```
     """
 
-    def __init__(self, data_source: Sized, repeat_count: int):
+    def __init__(self,
+                 data_source: Sized,
+                 repeat_count: int,
+                 seed: Optional[int] = None):
         self.data_source = data_source
         self.repeat_count = repeat_count
         self.num_samples = len(data_source)
+        self.seed = seed
+        self.generator = torch.Generator()  # Create a local random generator
+        if seed is not None:
+            self.generator.manual_seed(seed)
 
     def __iter__(self):
         indexes = [
-            idx for idx in torch.randperm(self.num_samples).tolist()
+            idx for idx in torch.randperm(self.num_samples,
+                                          generator=self.generator).tolist()
             for _ in range(self.repeat_count)
         ]
         return iter(indexes)
@@ -97,9 +109,13 @@ class GRPOTrainer(Trainer):
 
     dataset = load_dataset("trl-lib/tldr", split="train")
 
+    def reward_func(completions, **kwargs):
+        # Dummy reward function that rewards completions with more unique letters.
+        return [float(len(set(completion))) for completion in completions]
+
     trainer = GRPOTrainer(
         model="Qwen/Qwen2-0.5B-Instruct",
-        reward_funcs="weqweasdas/RM-Gemma-2B",
+        reward_funcs=reward_func,
         train_dataset=dataset,
     )
 
@@ -234,7 +250,7 @@ class GRPOTrainer(Trainer):
         if is_deepspeed_zero3_enabled():
             self.ref_model = AutoModelForCausalLM.from_pretrained(
                 model_id, **model_init_kwargs)
-        elif peft_config is None:
+        elif not is_peft_model(model):
             # If PEFT configuration is not provided, create a reference model based on the initial model.
             self.ref_model = create_reference_model(model)
         else:
@@ -256,6 +272,18 @@ class GRPOTrainer(Trainer):
                     i] = AutoModelForSequenceClassification.from_pretrained(
                         reward_func, num_labels=1, **model_init_kwargs)
         self.reward_funcs = reward_funcs
+
+        # Reward weights
+        if args.reward_weights is not None:
+            if len(args.reward_weights) != len(reward_funcs):
+                raise ValueError(
+                    f'Number of reward weights ({len(args.reward_weights)}) must match number of reward '
+                    f'functions ({len(reward_funcs)})')
+            self.reward_weights = torch.tensor(args.reward_weights,
+                                               dtype=torch.float32)
+        else:
+            self.reward_weights = torch.ones(len(reward_funcs),
+                                             dtype=torch.float32)
 
         # Reward processing class
         if reward_processing_classes is None:
@@ -345,6 +373,11 @@ class GRPOTrainer(Trainer):
                     f'eval batch size, the valid values for the number of generations are: {possible_values}.'
                 )
 
+        # Ensure each process receives a unique seed to prevent duplicate completions when generating with
+        # transformers if num_generations exceeds per_device_train_batch_size. We could skip it if we use vLLM, but
+        # it's safer to set it in all cases.
+        set_seed(args.seed, device_specific=True)
+
         if self.use_vllm:
             if not is_vllm_available():
                 raise ImportError(
@@ -379,9 +412,10 @@ class GRPOTrainer(Trainer):
                         for idx in range(self.accelerator.num_processes)
                 }:
                     warnings.warn(
-                        f'The requested device {vllm_device} is also used for training. This may lead to unexpected '
-                        'behavior. It is recommended to use a dedicated device for vLLM.'
-                    )
+                        f'The requested device {vllm_device} is also being used for training. For higher throughput '
+                        'and to avoid out-of-memory errors, it is recommended to use a dedicated device for vLLM. '
+                        'If this is intentional, you may ignore this warning but should adjust '
+                        '`vllm_gpu_memory_utilization` accordingly.')
                 # vLLM is not compatible with accelerate. So we need to patch it to make sure we can (1) place the vLLM
                 # model on the desired device (world_size_patch) and (2) avoid a test that is not designed for our
                 # setting (profiling_patch).
@@ -421,13 +455,21 @@ class GRPOTrainer(Trainer):
                         # This is particularly useful here because we generate completions from the same prompts.
                         enable_prefix_caching=True,
                         max_model_len=self.args.vllm_max_model_len,
-                        enforce_eager=True,  # 禁用算子融合
-                        block_size=16,  # 减少显存块分配粒度
                     )
 
+                # Guided decoding, if enabled
+                if args.vllm_guided_decoding_regex is not None:
+                    guided_decoding = GuidedDecodingParams(
+                        backend='outlines',
+                        regex=args.vllm_guided_decoding_regex)
+                else:
+                    guided_decoding = None
+                # Sampling parameters
                 self.sampling_params = SamplingParams(
                     temperature=args.temperature,
                     max_tokens=self.max_completion_length,
+                    guided_decoding=guided_decoding,
+                    n=args.num_generations,
                 )
 
             self._last_loaded_step = 0  # tag to avoid useless loading during grad accumulation
@@ -480,10 +522,22 @@ class GRPOTrainer(Trainer):
 
     # We need a custom sampler that samples the same prompt multiple times
     def _get_train_sampler(self) -> Sampler:
-        return RepeatRandomSampler(self.train_dataset, self.num_generations)
+        # Returns a sampler that ensures each prompt is repeated across multiple processes. This guarantees that
+        # identical prompts are distributed to different GPUs, allowing rewards to be computed and normalized correctly
+        # within each prompt group. Using the same seed across processes ensures consistent prompt assignment,
+        # preventing discrepancies in group formation.
+        return RepeatRandomSampler(self.train_dataset,
+                                   self.num_generations,
+                                   seed=self.args.seed)
 
     def _get_eval_sampler(self, eval_dataset) -> Sampler:
-        return RepeatRandomSampler(eval_dataset, self.num_generations)
+        # Returns a sampler that ensures each prompt is repeated across multiple processes. This guarantees that
+        # identical prompts are distributed to different GPUs, allowing rewards to be computed and normalized correctly
+        # within each prompt group. Using the same seed across processes ensures consistent prompt assignment,
+        # preventing discrepancies in group formation.
+        return RepeatRandomSampler(eval_dataset,
+                                   self.num_generations,
+                                   seed=self.args.seed)
 
     # Get the per-token log probabilities for the completions for the model and the reference model
     def _get_per_token_logps(self, model, input_ids, attention_mask,
@@ -509,7 +563,28 @@ class GRPOTrainer(Trainer):
                 gather_deepspeed3_params=self.args.ds3_gather_for_generation
         ) as unwrapped_model:
             if is_compiled_module(unwrapped_model):
-                state_dict = unwrapped_model._orig_mod.state_dict()
+                unwrapped_model = unwrapped_model._orig_mod
+            if is_peft_model(unwrapped_model):
+                unwrapped_model.merge_adapter()
+                state_dict = unwrapped_model.state_dict()
+                # Remove base_model and base_layer prefixes
+                state_dict = {
+                    k.removeprefix('base_model.model.').replace(
+                        '.base_layer', ''): v
+                    for k, v in state_dict.items()
+                }
+                # Remove values with adapter prefix (example: "_lora")
+                state_dict = {
+                    k: v
+                    for k, v in state_dict.items()
+                    if unwrapped_model.prefix not in k
+                }
+                # When module to save, remove its prefix and discard the original module
+                state_dict = {
+                    k.replace('modules_to_save.default.', ''): v
+                    for k, v in state_dict.items()
+                    if 'original_module' not in k
+                }
             else:
                 state_dict = unwrapped_model.state_dict()
         if self.accelerator.is_main_process:
@@ -520,6 +595,11 @@ class GRPOTrainer(Trainer):
                         state_dict[k] = v.to('cpu').to(self.args.vllm_device)
             llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
             llm_model.load_weights(state_dict.items())
+
+        # Unmerge the adapter to restore the model to its original state.
+        # This must be done after loading weights to ensure they correspond to the merged state.
+        if is_peft_model(unwrapped_model):
+            unwrapped_model.unmerge_adapter()
 
     def _prepare_inputs(
         self, inputs: dict[str, Union[torch.Tensor, Any]]
@@ -553,14 +633,18 @@ class GRPOTrainer(Trainer):
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             all_prompts_text = gather_object(prompts_text)
             if self.accelerator.is_main_process:
-                outputs = self.llm.generate(
-                    all_prompts_text,
+                # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
+                # num_generations outputs for each one. This is faster than generating outputs for each duplicate
+                # prompt individually.
+                ordered_set_of_prompts = list(dict.fromkeys(all_prompts_text))
+                all_outputs = self.llm.generate(
+                    ordered_set_of_prompts,
                     sampling_params=self.sampling_params,
                     use_tqdm=False)
-                completion_ids = [
-                    out.token_ids for completions in outputs
-                    for out in completions.outputs
-                ]
+                completion_ids = []
+                for outputs in all_outputs:
+                    for output in outputs.outputs:
+                        completion_ids.append(output.token_ids)
             else:
                 completion_ids = [None] * len(all_prompts_text)
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
@@ -631,10 +715,14 @@ class GRPOTrainer(Trainer):
         completions_text = self.processing_class.batch_decode(
             completion_ids, skip_special_tokens=True)
         if is_conversational(inputs[0]):
-            completions = [[{
-                'role': 'assistant',
-                'content': completion
-            }] for completion in completions_text]
+            completions = []
+            for prompt, completion in zip(prompts, completions_text):
+                bootstrap = prompt.pop(
+                )['content'] if prompt[-1]['role'] == 'assistant' else ''
+                completions.append([{
+                    'role': 'assistant',
+                    'content': bootstrap + completion
+                }])
         else:
             completions = completions_text
 
@@ -687,8 +775,9 @@ class GRPOTrainer(Trainer):
         # completions may be distributed across processes
         rewards_per_func = gather(rewards_per_func)
 
-        # Sum the rewards from all reward functions
-        rewards = rewards_per_func.sum(dim=1)
+        # Apply weights to each reward function's output and sum
+        rewards = (rewards_per_func *
+                   self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
 
         # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1,
@@ -784,8 +873,7 @@ class GRPOTrainer(Trainer):
         per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()
                                    ) * advantages.unsqueeze(1)
         per_token_loss = -(per_token_loss - self.beta * per_token_kl)
-        loss = ((per_token_loss * completion_mask).sum(dim=1) /
-                completion_mask.sum(dim=1)).mean()
+        loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
 
         # Log the metrics
         completion_length = self.accelerator.gather_for_metrics(

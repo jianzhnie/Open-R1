@@ -131,5 +131,3 @@ wandb/
 assets/
 work_dir/
 work_dirs/
-hf_hub/
-hf_hub

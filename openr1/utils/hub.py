@@ -1,7 +1,7 @@
-
 import logging
 import re
 from concurrent.futures import Future
+from typing import Union
 
 from huggingface_hub import (create_branch, create_repo,
                              get_safetensors_metadata, list_repo_commits,
@@ -15,7 +15,7 @@ from openr1.train.grpo.grpo_config import GRPOConfig
 logger = logging.getLogger(__name__)
 
 
-def push_to_hub_revision(training_args: SFTConfig | GRPOConfig,
+def push_to_hub_revision(training_args: Union[SFTConfig, GRPOConfig],
                          extra_ignore_patterns=[]) -> Future:
     """Pushes the model to branch on a Hub repo."""
 
@@ -52,7 +52,7 @@ def push_to_hub_revision(training_args: SFTConfig | GRPOConfig,
     return future
 
 
-def check_hub_revision_exists(training_args: SFTConfig | GRPOConfig):
+def check_hub_revision_exists(training_args: Union[SFTConfig, GRPOConfig]):
     """Checks if a given Hub revision exists."""
     if repo_exists(training_args.hub_model_id):
         if training_args.push_to_hub_revision is True:
@@ -67,10 +67,8 @@ def check_hub_revision_exists(training_args: SFTConfig | GRPOConfig):
                     repo_id=training_args.hub_model_id,
                     revision=training_args.hub_model_revision,
                 )
-                if (
-                    "README.md" in repo_files
-                    and training_args.overwrite_hub_revision is False
-                ):
+                if ('README.md' in repo_files
+                        and training_args.overwrite_hub_revision is False):
                     raise ValueError(
                         f'Revision {training_args.hub_model_revision} already exists. '
                         'Use --overwrite_hub_revision to overwrite it.')
