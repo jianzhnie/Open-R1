@@ -15,7 +15,6 @@ from accelerate import Accelerator
 from accelerate.utils import broadcast, gather, gather_object
 from datasets import Dataset
 from torch.utils.data import DataLoader
-from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers import (AutoTokenizer, BaseImageProcessor,
                           DataCollatorWithPadding, FeatureExtractionMixin,
                           GenerationConfig, PreTrainedModel,
@@ -25,6 +24,7 @@ from transformers.integrations import get_reporting_integration_callbacks
 from transformers.trainer import DEFAULT_CALLBACKS, DEFAULT_PROGRESS_CALLBACK
 from transformers.trainer_callback import (CallbackHandler, ExportableState,
                                            PrinterCallback)
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers.utils import is_peft_available
 from trl.core import masked_mean, masked_whiten
 from trl.data_utils import is_conversational, maybe_apply_chat_template
@@ -927,8 +927,9 @@ class PPOTrainer(Trainer):
             self.lr_scheduler.step()
             if (update + 1) % self.args.save_steps == 0:  # save checkpoint
                 self.save_model(
-                    os.path.join(self.args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}")
-                )
+                    os.path.join(
+                        self.args.output_dir,
+                        f'{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}'))
             self.control = self.callback_handler.on_step_end(
                 args, self.state, self.control)
             if self.control.should_save:
