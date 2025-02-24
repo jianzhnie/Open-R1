@@ -51,7 +51,8 @@ class GRPOConfig(TrainingArguments):
         vllm_device (`str`, *optional*, defaults to `"auto"`):
             Device where vLLM generation will run, e.g. `"cuda:1"`. If set to `"auto"` (default), the system will
             automatically select the next available GPU after the last one used for training. This assumes that
-            training has not already occupied all available GPUs.
+            training has not already occupied all available GPUs. If only one device is available, the device will be
+            shared between both training and vLLM.
         vllm_gpu_memory_utilization (`float`, *optional*, defaults to `0.9`):
             Ratio (between 0 and 1) of GPU memory to reserve for the model weights, activations, and KV cache on the
             device dedicated to generation powered by vLLM. Higher values will increase the KV cache size and thus
@@ -64,6 +65,8 @@ class GRPOConfig(TrainingArguments):
             If set, the `max_model_len` to use for vLLM. This could be useful when running with reduced
             `vllm_gpu_memory_utilization`, leading to a reduced KV cache size. If not set, vLLM will use the model
             context size, which might be much larger than the KV cache, leading to inefficiencies.
+        vllm_guided_decoding_regex (`str` or `None`, *optional*, defaults to `None`):
+            Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled.
 
         > Parameters that control the training
 
@@ -71,7 +74,15 @@ class GRPOConfig(TrainingArguments):
             Initial learning rate for [`AdamW`] optimizer. The default value replaces that of
             [`~transformers.TrainingArguments`].
         beta (`float`, *optional*, defaults to `0.04`):
-            KL coefficient.
+            KL coefficient. If `0.0`, the reference model is not loaded, reducing memory usage and improving training
+            speed.
+        num_iterations (`int`, *optional*, defaults to `1`):
+            Number of iterations per batch (denoted as μ in the algorithm).
+        epsilon (`float`, *optional*, defaults to `0.2`):
+            Epsilon value for clipping.
+        reward_weights (`list[float]` or `None`, *optional*, defaults to `None`):
+            Weights for each reward function. Must match the number of reward functions. If `None`, all rewards are
+            weighted equally with weight `1.0`.
         sync_ref_model (`bool`, *optional*, defaults to `False`):
             Whether to synchronize the reference model with the active model every `ref_model_sync_steps` steps, using
             the `ref_model_mixup_alpha` parameter. This synchronization originites from the
@@ -196,6 +207,13 @@ class GRPOConfig(TrainingArguments):
             'context size, which might be much larger than the KV cache, leading to inefficiencies.'
         },
     )
+    vllm_guided_decoding_regex: Optional[str] = field(
+        default=None,
+        metadata={
+            'help':
+            'Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled.'
+        },
+    )
 
     # Parameters that control the training
     learning_rate: float = field(
@@ -208,7 +226,30 @@ class GRPOConfig(TrainingArguments):
     )
     beta: float = field(
         default=0.04,
-        metadata={'help': 'KL coefficient.'},
+        metadata={
+            'help':
+            'KL coefficient. If `0.0`, the reference model is not loaded, reducing memory usage and improving '
+            'training speed.'
+        },
+    )
+    num_iterations: int = field(
+        default=1,
+        metadata={
+            'help':
+            'Number of iterations per batch (denoted as μ in the algorithm).'
+        },
+    )
+    epsilon: float = field(
+        default=0.2,
+        metadata={'help': 'Epsilon value for clipping.'},
+    )
+    reward_weights: Optional[list[float]] = field(
+        default=None,
+        metadata={
+            'help':
+            'Weights for each reward function. Must match the number of reward functions. If `None`, all '
+            'rewards are weighted equally with weight `1.0`.'
+        },
     )
     sync_ref_model: bool = field(
         default=False,
