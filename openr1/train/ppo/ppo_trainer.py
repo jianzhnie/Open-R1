@@ -15,6 +15,7 @@ from accelerate import Accelerator
 from accelerate.utils import broadcast, gather, gather_object
 from datasets import Dataset
 from torch.utils.data import DataLoader
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers import (AutoTokenizer, BaseImageProcessor,
                           DataCollatorWithPadding, FeatureExtractionMixin,
                           GenerationConfig, PreTrainedModel,
@@ -924,6 +925,10 @@ class PPOTrainer(Trainer):
                 self.log(metrics)
 
             self.lr_scheduler.step()
+            if (update + 1) % self.args.save_steps == 0:  # save checkpoint
+                self.save_model(
+                    os.path.join(self.args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}")
+                )
             self.control = self.callback_handler.on_step_end(
                 args, self.state, self.control)
             if self.control.should_save:
