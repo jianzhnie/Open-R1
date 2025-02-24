@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 import datasets
 import torch
 import transformers
-from accelerate import PartialState
 from datasets import load_dataset
 from transformers import (AutoModelForCausalLM,
                           AutoModelForSequenceClassification, AutoTokenizer,
@@ -20,7 +19,6 @@ sys.path.append(os.getcwd())
 
 from openr1.train.ppo.ppo_config import PPOConfig
 from openr1.train.ppo.ppo_trainer import PPOTrainer
-from openr1.utils.callbacks import get_callbacks
 from openr1.utils.reward_funcs import (accuracy_reward, format_reward,
                                        get_cosine_scaled_reward,
                                        get_repetition_penalty_reward,
@@ -209,9 +207,10 @@ def main(script_args: PPOScriptArguments, training_args: PPOConfig,
     reward_funcs = [
         REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs
     ]
+    reward_func_names = [func for func in script_args.reward_funcs]
 
     # Format into conversation
-    def make_conversation(example, tokenizer):
+    def make_conversation(example):
 
         prompt = [
             {
@@ -228,8 +227,7 @@ def main(script_args: PPOScriptArguments, training_args: PPOConfig,
     # 处理数据集 - 修复这里的调用
     dataset = dataset.map(
         function=make_conversation,
-        fn_kwargs={'tokenizer': tokenizer},  # 传入tokenizer参数
-        desc='Processing dataset',
+        desc='Processing dataset, convert to `conversation` formate',
     )
     for split in dataset:
         if 'messages' in dataset[split].column_names:
@@ -237,8 +235,8 @@ def main(script_args: PPOScriptArguments, training_args: PPOConfig,
                 ['messages', 'problem'])
 
     # 打印处理后的样本示例
-    print('\nProcessed example:')
-    print(dataset[script_args.dataset_train_split][0])
+    logger.info('\nProcessed example:')
+    logger.info(dataset[script_args.dataset_train_split][0])
 
     ################
     #  Initialize the PPO trainer
@@ -248,11 +246,11 @@ def main(script_args: PPOScriptArguments, training_args: PPOConfig,
         model=policy,
         ref_model=ref_policy,
         reward_funcs=reward_funcs,
+        reward_func_names=reward_func_names,
         value_model=value_model,
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split],
         processing_class=tokenizer,
-        # callbacks=get_callbacks(training_args, model_args),
         peft_config=peft_config,
     )
 
@@ -280,7 +278,6 @@ def main(script_args: PPOScriptArguments, training_args: PPOConfig,
     logger.info('*** Save model ***')
     trainer.save_model(training_args.output_dir)
     logger.info(f'Model saved to {training_args.output_dir}')
-    trainer.save_model(training_args.output_dir)
 
     # Save everything else on main process
     kwargs = {

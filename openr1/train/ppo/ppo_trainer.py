@@ -5,7 +5,7 @@ import textwrap
 import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
-from typing import Callable, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -78,6 +78,7 @@ class PPOTrainer(Trainer):
         ref_model: Optional[nn.Module],
         value_model: Optional[nn.Module],
         reward_funcs: RewardFunc,
+        reward_func_names: List[str],
         processing_class: Optional[Union[PreTrainedTokenizerBase,
                                          BaseImageProcessor,
                                          FeatureExtractionMixin,
@@ -106,17 +107,6 @@ class PPOTrainer(Trainer):
         # Data collator
         def data_collator(features):  # No data collation is needed in GRPO
             return features
-
-        super().__init__(
-            model=model,
-            args=args,
-            data_collator=data_collator,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            processing_class=processing_class,
-            callbacks=callbacks,
-            optimizers=optimizers,
-        )
 
         # Handle stop token settings: update policy model's generation_config to use provided stop token
         if args.stop_token and args.stop_token_id:
@@ -167,6 +157,7 @@ class PPOTrainer(Trainer):
             if isinstance(reward_func, PreTrainedModel):
                 reward_funcs[i] = reward_func
         self.reward_funcs = reward_funcs
+        self.reward_func_names = reward_func_names
 
         # Reward weights
         if args.reward_weights is not None:
@@ -500,14 +491,14 @@ class PPOTrainer(Trainer):
                     key: [example[key] for example in data]
                     for key in keys
                 }
-                prompt_inputs = self.processing_class(prompts_text,
-                                                      return_tensors='pt',
-                                                      padding=True,
-                                                      padding_side='left',
-                                                      add_special_tokens=False)
-                prompt_inputs = super()._prepare_inputs(prompt_inputs)
-                queries, query_mask = prompt_inputs[
-                    'input_ids'], prompt_inputs['attention_mask']
+                query_inputs = self.processing_class(prompts_text,
+                                                     return_tensors='pt',
+                                                     padding=True,
+                                                     padding_side='left',
+                                                     add_special_tokens=False)
+                query_inputs = super()._prepare_inputs(query_inputs)
+                queries, query_mask = query_inputs['input_ids'], query_inputs[
+                    'attention_mask']
 
                 context_length = queries.shape[1]
                 responses = []
@@ -517,6 +508,10 @@ class PPOTrainer(Trainer):
                 scores = []
                 sequence_lengths = []
                 values = []
+                reward_func_metrics = {}
+                for i, func_name in enumerate(self.reward_func_names):
+                    reward_func_metrics[func_name] = []
+
                 with unwrap_model_for_generation(
                         self.model,
                         self.accelerator,
@@ -615,6 +610,7 @@ class PPOTrainer(Trainer):
                     for i, (reward_func, reward_processing_class) in enumerate(
                             zip(self.reward_funcs,
                                 self.reward_processing_classes)):
+
                         # Module instead of PretrainedModel for compat with compiled models
                         if isinstance(reward_func, nn.Module):
 
@@ -624,6 +620,7 @@ class PPOTrainer(Trainer):
                                     reward_processing_class.pad_token_id,
                                     context_length)
                         else:
+
                             output_reward_func = reward_func(
                                 prompts=query_text,
                                 completions=completions,
@@ -638,6 +635,10 @@ class PPOTrainer(Trainer):
                     # completions may be distributed across processes
                     rewards_per_func = gather(rewards_per_func)
 
+                    for i, func_name in enumerate(self.reward_func_names):
+                        reward_func_metrics[func_name].append(
+                            rewards_per_func[:, i])
+
                     # Apply weights to each reward function's output and sum
                     score = (rewards_per_func *
                              self.reward_weights.to(device).unsqueeze(0)).sum(
@@ -650,6 +651,12 @@ class PPOTrainer(Trainer):
                     sequence_lengths.append(sequence_length)
                     scores.append(score)
                     values.append(value)
+
+                reward_func_metrics = {
+                    func_name: torch.cat(reward_func_metrics[func_name], 0)
+                    for func_name in self.reward_func_names
+                }
+
                 responses = torch.cat(responses, 0)
                 postprocessed_responses = torch.cat(postprocessed_responses, 0)
                 logprobs = torch.cat(logprobs, 0)
@@ -858,10 +865,20 @@ class PPOTrainer(Trainer):
                 mean_kl = kl.sum(1).mean()
                 mean_entropy = (-logprobs).sum(1).mean()
                 mean_non_score_reward = non_score_reward.sum(1).mean()
+                mean_sequence_length = sequence_lengths.float().mean()
+                mean_reward_per_func = {
+                    func_name: reward_func_metrics[func_name].mean()
+                    for func_name in self.reward_func_names
+                }
                 rlhf_reward = mean_non_score_reward + scores.mean()
                 eps = int(self.state.episode / (time.time() - start_time))
                 metrics = {}
                 metrics['eps'] = eps
+                for key, val in mean_reward_per_func.items():
+                    metrics['reward_funcs/' + str(key)] = val.item()
+                metrics[
+                    'reward_funcs/sequence_length'] = mean_sequence_length.item(
+                    )
                 metrics['objective/kl'] = self.accelerator.gather_for_metrics(
                     mean_kl).mean().item()
                 metrics[
@@ -983,13 +1000,13 @@ class PPOTrainer(Trainer):
                     key: [example[key] for example in batch]
                     for key in keys
                 }
-                prompt_inputs = self.processing_class(prompts_text,
-                                                      return_tensors='pt',
-                                                      padding=True,
-                                                      padding_side='left',
-                                                      add_special_tokens=False)
-                prompt_inputs = super()._prepare_inputs(prompt_inputs)
-                query, query_mask = prompt_inputs['input_ids'], prompt_inputs[
+                query_inputs = self.processing_class(prompts_text,
+                                                     return_tensors='pt',
+                                                     padding=True,
+                                                     padding_side='left',
+                                                     add_special_tokens=False)
+                query_inputs = super()._prepare_inputs(query_inputs)
+                query, query_mask = query_inputs['input_ids'], query_inputs[
                     'attention_mask']
 
                 with torch.no_grad():
