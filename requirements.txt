@@ -4,11 +4,11 @@ bitsandbytes
 datasets
 deepspeed
 evaluate
+latex2sympy2_extended
 math_verify
 peft
 sentencepiece
+transformers
 tokenizers
 torch
-transformers
 trl
-latex2sympy2_extended

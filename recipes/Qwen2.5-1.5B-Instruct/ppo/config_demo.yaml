@@ -45,7 +45,7 @@ logging_strategy: steps
 report_to: tensorboard
 
 # output
-output_dir: ./work_dir/Qwen2.5-1.5B-Open-R1-GRPO
+output_dir: ./work_dir/Qwen2.5-1.5B-Open-R1-PPO
 overwrite_output_dir: true
 save_strategy: steps
 save_steps: 1000
