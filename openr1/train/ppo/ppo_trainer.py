@@ -37,7 +37,7 @@ from trl.trainer.utils import (
     get_reward, log_table_to_comet_experiment, peft_module_casting_to_bf16,
     prepare_deepspeed, print_rich_table, truncate_response)
 
-from openr1.train.ppo.ppo_config import PPOConfig
+from openr1.train.ppo.configs import PPOConfig
 from openr1.utils.utils import selective_log_softmax
 
 if is_peft_available():

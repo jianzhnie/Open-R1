@@ -12,7 +12,7 @@ from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config
 
 sys.path.append(os.getcwd())
 
-from openr1.train.ppo.ppo_config import PPOConfig
+from openr1.train.ppo.configs import PPOConfig
 from openr1.train.ppo.ppo_trainer import PPOTrainer
 from openr1.utils.model_utils import get_tokenizer
 from openr1.utils.reward_funcs import (accuracy_reward, code_reward,

@@ -6,7 +6,7 @@ from trl.trainer.utils import OnPolicyConfig
 
 
 @dataclass
-class PPOConfig(OnPolicyConfig):
+class TrlPPOConfig(OnPolicyConfig):
     r"""
     Configuration class for the [`PPOTrainer`].
 
