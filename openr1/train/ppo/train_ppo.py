@@ -7,22 +7,20 @@ import datasets
 import torch
 import transformers
 from datasets import load_dataset
-from transformers import (AutoModelForCausalLM,
-                          AutoModelForSequenceClassification, AutoTokenizer,
-                          set_seed)
 from transformers.trainer_utils import get_last_checkpoint
-from trl import (ModelConfig, ScriptArguments, TrlParser, get_kbit_device_map,
-                 get_peft_config, get_quantization_config)
-from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
+from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config
 
 sys.path.append(os.getcwd())
 
 from openr1.train.ppo.ppo_config import PPOConfig
 from openr1.train.ppo.ppo_trainer import PPOTrainer
-from openr1.utils.reward_funcs import (accuracy_reward, format_reward,
+from openr1.utils.model_utils import get_tokenizer
+from openr1.utils.reward_funcs import (accuracy_reward, code_reward,
+                                       format_reward, get_code_format_reward,
                                        get_cosine_scaled_reward,
                                        get_repetition_penalty_reward,
-                                       reasoning_steps_reward)
+                                       len_reward, reasoning_steps_reward,
+                                       tag_count_reward)
 
 logger = logging.getLogger(__name__)
 
@@ -47,11 +45,10 @@ class PPOScriptArguments(ScriptArguments):
     """
 
     reward_funcs: list[str] = field(
-        default_factory=lambda:
-        ['accuracy', 'format', 'reasoning_steps', 'cosine'],
+        default_factory=lambda: ['accuracy', 'format', 'tag_count'],
         metadata={
             'help':
-            "List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine', 'repetition_penalty'"
+            "List of reward functions. Possible values: 'accuracy', 'format', 'format_deepseek', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', tag_count', 'code', 'code_format'"
         },
     )
     cosine_min_value_wrong: float = field(
@@ -86,6 +83,14 @@ class PPOScriptArguments(ScriptArguments):
             'Maximum (negative) penalty for for repetition penalty reward'
         },
     )
+    code_language: str = field(
+        default='python',
+        metadata={
+            'help':
+            'Language for code format reward. Based on E2B supported languages https://e2b.dev/docs/code-interpreting/supported-languages',
+            'choices': ['python', 'javascript', 'r', 'java', 'bash'],
+        },
+    )
 
 
 SYSTEM_PROMPT = (
@@ -97,8 +102,6 @@ SYSTEM_PROMPT = (
 
 def main(script_args: PPOScriptArguments, training_args: PPOConfig,
          model_args: ModelConfig):
-
-    set_seed(training_args.seed)
 
     ###############
     # Setup logging
@@ -123,7 +126,7 @@ def main(script_args: PPOScriptArguments, training_args: PPOConfig,
     )
     logger.info(f'Model parameters {model_args}')
     logger.info(f'Script parameters {script_args}')
-    logger.info(f'Data parameters {training_args}')
+    logger.info(f'Training parameters {training_args}')
 
     # Check for last checkpoint
     last_checkpoint = None
@@ -134,54 +137,11 @@ def main(script_args: PPOScriptArguments, training_args: PPOConfig,
             f'Checkpoint detected, resuming training at {last_checkpoint=}.')
 
     ################
-    # Model & Tokenizer
-    ################
-    logger.info('*** Initializing model kwargs ***')
-    torch_dtype = (model_args.torch_dtype if model_args.torch_dtype in [
-        'auto', None
-    ] else getattr(torch, model_args.torch_dtype))
-    quantization_config = get_quantization_config(model_args)
-    model_kwargs = dict(
-        revision=model_args.model_revision,
-        attn_implementation=model_args.attn_implementation,
-        torch_dtype=torch_dtype,
-        device_map=get_kbit_device_map()
-        if quantization_config is not None else None,
-        quantization_config=quantization_config,
-    )
-    training_args.model_init_kwargs = model_kwargs
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path,
-        padding_side='left',
-        trust_remote_code=model_args.trust_remote_code)
-    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-    if tokenizer.chat_template is None:
-        tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
-    value_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path,
-        trust_remote_code=model_args.trust_remote_code,
-        num_labels=1)
-    # reward_model = AutoModelForSequenceClassification.from_pretrained(
-    #     training_args.reward_model_path,
-    #     trust_remote_code=model_args.trust_remote_code,
-    #     num_labels=1)
-    policy = AutoModelForCausalLM.from_pretrained(
-        training_args.sft_model_path,
-        trust_remote_code=model_args.trust_remote_code)
-
-    peft_config = get_peft_config(model_args)
-    if peft_config is None:
-        ref_policy = AutoModelForCausalLM.from_pretrained(
-            training_args.sft_model_path,
-            trust_remote_code=model_args.trust_remote_code)
-    else:
-        ref_policy = None
-
-    ################
     # Dataset
     ################
     dataset = load_dataset(script_args.dataset_name,
                            name=script_args.dataset_config)
+
     # Get reward functions
     REWARD_FUNCS_REGISTRY = {
         'accuracy':
@@ -203,6 +163,14 @@ def main(script_args: PPOScriptArguments, training_args: PPOConfig,
             ngram_size=script_args.repetition_n_grams,
             max_penalty=script_args.repetition_max_penalty,
         ),
+        'length':
+        len_reward,
+        'code':
+        code_reward,
+        'code_format':
+        get_code_format_reward(language=script_args.code_language),
+        'tag_count':
+        tag_count_reward,
     }
     reward_funcs = [
         REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs
@@ -212,16 +180,15 @@ def main(script_args: PPOScriptArguments, training_args: PPOConfig,
     # Format into conversation
     def make_conversation(example):
 
-        prompt = [
-            {
+        prompt = []
+
+        if training_args.system_prompt is not None:
+            prompt.append({
                 'role': 'system',
-                'content': SYSTEM_PROMPT
-            },
-            {
-                'role': 'user',
-                'content': example['problem']
-            },
-        ]
+                'content': training_args.system_prompt
+            })
+
+        prompt.append({'role': 'user', 'content': example['problem']})
         return {'prompt': prompt}
 
     # 处理数据集 - 修复这里的调用
@@ -231,27 +198,45 @@ def main(script_args: PPOScriptArguments, training_args: PPOConfig,
     )
     for split in dataset:
         if 'messages' in dataset[split].column_names:
-            dataset[split] = dataset[split].remove_columns(
-                ['messages', 'problem'])
+            dataset[split] = dataset[split].remove_columns(['messages'])
 
     # 打印处理后的样本示例
     logger.info('\nProcessed example:')
     logger.info(dataset[script_args.dataset_train_split][0])
 
     ################
+    # Load tokenizer
+    ################
+    tokenizer = get_tokenizer(model_args, training_args)
+
+    ################
+    # Model
+    ################
+    logger.info('*** Initializing model kwargs ***')
+    torch_dtype = (model_args.torch_dtype if model_args.torch_dtype in [
+        'auto', None
+    ] else getattr(torch, model_args.torch_dtype))
+    model_kwargs = dict(
+        revision=model_args.model_revision,
+        trust_remote_code=model_args.trust_remote_code,
+        attn_implementation=model_args.attn_implementation,
+        torch_dtype=torch_dtype,
+        use_cache=False if training_args.gradient_checkpointing else True,
+    )
+    training_args.model_init_kwargs = model_kwargs
+
+    ################
     #  Initialize the PPO trainer
     ################
     trainer = PPOTrainer(
         args=training_args,
-        model=policy,
-        ref_model=ref_policy,
+        policy_model=model_args.model_name_or_path,
         reward_funcs=reward_funcs,
         reward_func_names=reward_func_names,
-        value_model=value_model,
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split],
         processing_class=tokenizer,
-        peft_config=peft_config,
+        peft_config=get_peft_config(model_args),
     )
 
     ###############

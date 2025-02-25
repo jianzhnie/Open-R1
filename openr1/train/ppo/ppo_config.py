@@ -49,7 +49,15 @@ class PPOConfig(OnPolicyConfig):
         default=os.path.basename(__file__)[:-3],
         metadata={'help': 'Name of this experiment.'},
     )
-    reward_model_path: str = field(
+    model_init_kwargs: Optional[dict] = field(
+        default=None,
+        metadata={
+            'help':
+            'Keyword arguments for `transformers.AutoModelForCausalLM.from_pretrained`, used when the `model` '
+            'argument of the `GRPOTrainer` is provided as a string.'
+        },
+    )
+    value_model_path: str = field(
         default='EleutherAI/pythia-160m',
         metadata={'help': 'Path to the reward model.'},
     )

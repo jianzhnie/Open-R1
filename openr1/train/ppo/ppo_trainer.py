@@ -12,15 +12,16 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from accelerate import Accelerator
-from accelerate.utils import broadcast, gather, gather_object
+from accelerate.utils import broadcast, gather, gather_object, is_peft_model
 from datasets import Dataset
 from torch.utils.data import DataLoader
-from transformers import (AutoTokenizer, BaseImageProcessor,
-                          DataCollatorWithPadding, FeatureExtractionMixin,
-                          GenerationConfig, PreTrainedModel,
-                          PreTrainedTokenizerBase, ProcessorMixin, Trainer,
-                          TrainerCallback, TrainerControl, is_wandb_available)
+from transformers import (
+    AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer,
+    BaseImageProcessor, DataCollatorWithPadding, FeatureExtractionMixin,
+    GenerationConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin,
+    Trainer, TrainerCallback, TrainerControl, is_wandb_available)
 from transformers.integrations import get_reporting_integration_callbacks
+from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.trainer import DEFAULT_CALLBACKS, DEFAULT_PROGRESS_CALLBACK
 from transformers.trainer_callback import (CallbackHandler, ExportableState,
                                            PrinterCallback)
@@ -75,9 +76,9 @@ class PPOTrainer(Trainer):
     def __init__(
         self,
         args: PPOConfig,
-        model: nn.Module,
-        ref_model: Optional[nn.Module],
-        value_model: Optional[nn.Module],
+        policy_model: Union[str, PreTrainedModel],
+        ref_model: Optional[Union[str, PreTrainedModel]],
+        value_model: Optional[Union[str, PreTrainedModel]],
         reward_funcs: RewardFunc,
         reward_func_names: List[str],
         processing_class: Optional[Union[PreTrainedTokenizerBase,
@@ -95,19 +96,43 @@ class PPOTrainer(Trainer):
         callbacks: Optional[list[TrainerCallback]] = None,
         peft_config: Optional['PeftConfig'] = None,
     ) -> None:
-        if ref_model is model:
-            raise ValueError(
-                '`model` and `ref_model` cannot be the same object. If you want `ref_model` to be the '
-                'same as `model`, you must make a copy of it, or `None` if you use peft.'
-            )
 
         self.args = args
         self.processing_class = processing_class
-        self.policy_model = model
 
-        # Data collator
-        def data_collator(features):  # No data collation is needed in GRPO
-            return features
+        # Trained model
+        model_init_kwargs = args.model_init_kwargs or {}
+        if isinstance(policy_model, str):
+            model_id = policy_model
+            torch_dtype = model_init_kwargs.get('torch_dtype')
+            if (isinstance(torch_dtype, torch.dtype) or torch_dtype == 'auto'
+                    or torch_dtype is None):
+                pass  # torch_dtype is already a torch.dtype or "auto" or None
+            elif isinstance(torch_dtype, str):  # it's a str, but not "auto"
+                torch_dtype = getattr(torch, torch_dtype)
+                model_init_kwargs['torch_dtype'] = torch_dtype
+            else:
+                raise ValueError(
+                    "Invalid `torch_dtype` passed to `GRPOConfig`. Expected either 'auto' or a string representing "
+                    f"a `torch.dtype` (e.g., 'float32'), but got {torch_dtype}."
+                )
+            # Disable caching if gradient checkpointing is enabled (not supported)
+            model_init_kwargs['use_cache'] = (
+                False if args.gradient_checkpointing else
+                model_init_kwargs.get('use_cache'))
+            self.policy_model = AutoModelForCausalLM.from_pretrained(
+                policy_model, **model_init_kwargs)
+        else:
+            model_id = policy_model.config._name_or_path
+            if args.model_init_kwargs is not None:
+                raise ValueError(
+                    'You passed `model_init_kwargs` to the `PPOConfig`, but your model is already instantiated. '
+                    'This argument can only be used when the `model` argument is a string.'
+                )
+        # Enable gradient checkpointing if requested
+        if args.gradient_checkpointing:
+            self.policy_model = self._enable_gradient_checkpointing(
+                self.policy_model, args)
 
         # Handle stop token settings: update policy model's generation_config to use provided stop token
         if args.stop_token and args.stop_token_id:
@@ -144,12 +169,29 @@ class PPOTrainer(Trainer):
         self.model_adapter_name = args.model_adapter_name
         self.ref_adapter_name = args.ref_adapter_name
 
-        if ref_model:
-            self.ref_model = ref_model
-        elif self.is_peft_model:
+        # Reference model
+        self.ref_model = ref_model
+        self.kl_coef = args.kl_coef
+        if self.kl_coef == 0.0:
+            # If beta is 0.0, the reference model is not needed
+            self.ref_model = None
+        elif is_deepspeed_zero3_enabled():
+            self.ref_model = AutoModelForCausalLM.from_pretrained(
+                model_id, **model_init_kwargs)
+        elif is_peft_model:
+            # If PEFT is used, the reference model is not needed since the adapter can be disabled
+            # to revert to the initial model.
             self.ref_model = None
         else:
+            # If PEFT configuration is not provided, create a reference model based on the initial model.
             self.ref_model = create_reference_model(self.policy_model)
+
+        # Vlaue Model
+        if args.value_model_path:
+            self.value_model = AutoModelForSequenceClassification.from_pretrained(
+                args.value_model_path,
+                trust_remote_code=model_init_kwargs.trust_remote_code,
+                num_labels=1)
 
         # Reward functions
         if not isinstance(reward_funcs, list):
@@ -171,6 +213,13 @@ class PPOTrainer(Trainer):
         else:
             self.reward_weights = torch.ones(len(reward_funcs),
                                              dtype=torch.float32)
+
+        # Processing class
+        if processing_class is None:
+            processing_class = AutoTokenizer.from_pretrained(
+                policy_model.config._name_or_path,
+                padding_side='left',
+                trust_remote_code=model_init_kwargs.trust_remote_code)
 
         # Reward processing class
         if reward_processing_classes is None:
@@ -205,6 +254,10 @@ class PPOTrainer(Trainer):
         self.data_collator = data_collator
         self.optimizer, self.lr_scheduler = optimizers
         self.optimizer_cls_and_kwargs = None  # needed for transformers >= 4.47
+
+        # Data collator
+        def data_collator(features):  # No data collation is needed in GRPO
+            return features
 
         #########
         # calculate various batch sizes
@@ -374,6 +427,28 @@ class PPOTrainer(Trainer):
     def get_eval_dataloader(self) -> DataLoader:
         return self.eval_dataloader
 
+    def _enable_gradient_checkpointing(self, model: PreTrainedModel,
+                                       args: PPOConfig) -> PreTrainedModel:
+        """Enables gradient checkpointing for the model."""
+        # Ensure use_cache is disabled
+        model.config.use_cache = False
+
+        # Enable gradient checkpointing on the base model for PEFT
+        if is_peft_model(model):
+            model.base_model.gradient_checkpointing_enable()
+        # Enable gradient checkpointing for non-PEFT models
+        else:
+            model.gradient_checkpointing_enable()
+
+        gradient_checkpointing_kwargs = args.gradient_checkpointing_kwargs or {}
+        use_reentrant = ('use_reentrant' not in gradient_checkpointing_kwargs
+                         or gradient_checkpointing_kwargs['use_reentrant'])
+
+        if use_reentrant:
+            model.enable_input_require_grads()
+
+        return model
+
     @contextmanager
     def null_ref_context(self):
         """Context manager for handling null reference model (that is, peft
@@ -483,7 +558,6 @@ class PPOTrainer(Trainer):
                                               self.processing_class)['prompt']
                     for example in data
                 ]
-
                 keys = [
                     key for key in data[0]
                     if key not in ['prompt', 'completion']

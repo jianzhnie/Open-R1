@@ -28,7 +28,7 @@ from transformers.utils import is_peft_available
 from trl.data_utils import (apply_chat_template, is_conversational,
                             maybe_apply_chat_template)
 from trl.extras.profiling import profiling_decorator
-from trl.import_utils import is_vllm_available
+from trl.import_utils import is_rich_available, is_vllm_available
 from trl.models import (create_reference_model, prepare_deepspeed,
                         unwrap_model_for_generation)
 from trl.trainer.callbacks import SyncRefModelCallback
@@ -146,7 +146,7 @@ class RepeatRandomSampler(Sampler):
 
 class GRPOTrainer(Trainer):
     """Trainer for the Group Relative Policy Optimization (GRPO) method. This
-    Algorithm was initially proposed in the paper [DeepSeekMath: Pushing the
+    algorithm was initially proposed in the paper [DeepSeekMath: Pushing the
     Limits of Mathematical Reasoning in Open Language
     Models](https://huggingface.co/papers/2402.03300).
 
@@ -239,7 +239,7 @@ class GRPOTrainer(Trainer):
         self,
         model: Union[str, PreTrainedModel],
         reward_funcs: Union[RewardFunc, list[RewardFunc]],
-        args: GRPOConfig = None,
+        args: Optional[GRPOConfig] = None,
         train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
         eval_dataset: Optional[Union[Dataset, IterableDataset,
                                      dict[str,
@@ -975,22 +975,31 @@ class GRPOTrainer(Trainer):
         self._metrics[mode]['reward_std'].append(
             std_grouped_rewards.mean().item())
 
-        if (self.log_completions
-                and self.state.global_step % self.args.logging_steps == 0
-                and 'wandb' in self.args.report_to):
-            import pandas as pd
+        if self.log_completions and self.state.global_step % self.args.logging_steps == 0:
+            prompts_to_log = gather_object(prompts_text)
+            completions_to_log = gather_object(completions_text)
+            rewards_to_log = rewards.tolist()
 
-            # For logging
-            table = {
-                'step': [str(self.state.global_step)] * len(rewards),
-                'prompt': gather_object(prompts_text),
-                'completion': gather_object(completions_text),
-                'reward': rewards.tolist(),
-            }
-            df = pd.DataFrame(table)
+            if self.accelerator.is_main_process:
+                if is_rich_available():
+                    print_prompt_completions_sample(
+                        prompts_to_log,
+                        completions_to_log,
+                        rewards_to_log,
+                        self.state.global_step,
+                    )
+                if self.args.report_to and 'wandb' in self.args.report_to and wandb.run is not None:
+                    import pandas as pd
 
-            if wandb.run is not None and self.accelerator.is_main_process:
-                wandb.log({'completions': wandb.Table(dataframe=df)})
+                    # For logging
+                    table = {
+                        'step': [str(self.state.global_step)] * len(rewards),
+                        'prompt': prompts_to_log,
+                        'completion': completions_to_log,
+                        'reward': rewards.tolist(),
+                    }
+                    df = pd.DataFrame(table)
+                    wandb.log({'completions': wandb.Table(dataframe=df)})
 
         return {
             'prompt_ids': prompt_ids,
