@@ -7,6 +7,10 @@ from openr1.train.ppo.ppo_config import TrlPPOConfig
 @dataclass
 class PPOConfig(TrlPPOConfig):
     """args for callbacks, benchmarks etc."""
+    reward_model_path: str = field(
+        default='None',
+        metadata={'help': 'Path to the reward model.'},
+    )
     value_model_path: str = field(
         default='None',
         metadata={'help': 'Path to the reward model.'},

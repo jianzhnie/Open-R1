@@ -6,7 +6,10 @@ from dataclasses import dataclass, field
 import datasets
 import torch
 import transformers
+from accelerate import PartialState
 from datasets import load_dataset
+from transformers import (AutoModelForCausalLM,
+                          AutoModelForSequenceClassification, AutoTokenizer)
 from transformers.trainer_utils import get_last_checkpoint
 from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config
 
@@ -14,7 +17,6 @@ sys.path.append(os.getcwd())
 
 from openr1.train.ppo.configs import PPOConfig
 from openr1.train.ppo.ppo_trainer import PPOTrainer
-from openr1.utils.model_utils import get_tokenizer
 from openr1.utils.reward_funcs import (accuracy_reward, code_reward,
                                        format_reward, get_code_format_reward,
                                        get_cosine_scaled_reward,
@@ -128,6 +130,44 @@ def main(script_args: PPOScriptArguments, training_args: PPOConfig,
     logger.info(f'Script parameters {script_args}')
     logger.info(f'Training parameters {training_args}')
 
+    ################
+    # Model & Tokenizer
+    ################
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_args.model_name_or_path,
+        revision=model_args.model_revision,
+        trust_remote_code=model_args.trust_remote_code,
+    )
+    torch_dtype = (model_args.torch_dtype if model_args.torch_dtype in [
+        'auto', None
+    ] else getattr(torch, model_args.torch_dtype))
+    model_kwargs = dict(
+        revision=model_args.model_revision,
+        attn_implementation=model_args.attn_implementation,
+        torch_dtype=torch_dtype,
+    )
+
+    value_model = AutoModelForSequenceClassification.from_pretrained(
+        training_args.value_model_path,
+        trust_remote_code=model_args.trust_remote_code,
+        num_labels=1)
+    reward_model = AutoModelForSequenceClassification.from_pretrained(
+        training_args.reward_model_path,
+        trust_remote_code=model_args.trust_remote_code,
+        num_labels=1)
+    policy_model = AutoModelForCausalLM.from_pretrained(
+        model_args.model_name_or_path,
+        trust_remote_code=model_args.trust_remote_code)
+
+    peft_config = get_peft_config(model_args)
+    if peft_config is None:
+        ref_model = AutoModelForCausalLM.from_pretrained(
+            model_args.model_name_or_path,
+            trust_remote_code=model_args.trust_remote_code)
+    else:
+        ref_model = None
+
     # Check for last checkpoint
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir):
@@ -180,59 +220,42 @@ def main(script_args: PPOScriptArguments, training_args: PPOConfig,
     # Format into conversation
     def make_conversation(example):
 
-        prompt = []
-
-        if training_args.system_prompt is not None:
-            prompt.append({
+        prompt = [
+            {
                 'role': 'system',
-                'content': training_args.system_prompt
-            })
-
-        prompt.append({'role': 'user', 'content': example['problem']})
+                'content': SYSTEM_PROMPT
+            },
+            {
+                'role': 'user',
+                'content': example['problem']
+            },
+        ]
         return {'prompt': prompt}
 
-    # 处理数据集 - 修复这里的调用
-    dataset = dataset.map(
-        function=make_conversation,
-        desc='Processing dataset, convert to `conversation` formate',
-    )
+    # Compute that only on the main process for faster data processing.
+    # see: https://github.com/huggingface/trl/pull/1255
+    with PartialState().local_main_process_first():
+        # 处理数据集 - 修复这里的调用
+        dataset = dataset.map(
+            function=make_conversation,
+            desc='Processing dataset, convert to `conversation` formate',
+        )
     for split in dataset:
         if 'messages' in dataset[split].column_names:
-            dataset[split] = dataset[split].remove_columns(['messages'])
+            dataset[split] = dataset[split].remove_columns(['messages', 'problem'])
 
     # 打印处理后的样本示例
     logger.info('\nProcessed example:')
     logger.info(dataset[script_args.dataset_train_split][0])
 
     ################
-    # Load tokenizer
-    ################
-    tokenizer = get_tokenizer(model_args, training_args)
-
-    ################
-    # Model
-    ################
-    logger.info('*** Initializing model kwargs ***')
-    torch_dtype = (model_args.torch_dtype if model_args.torch_dtype in [
-        'auto', None
-    ] else getattr(torch, model_args.torch_dtype))
-    model_kwargs = dict(
-        revision=model_args.model_revision,
-        trust_remote_code=model_args.trust_remote_code,
-        attn_implementation=model_args.attn_implementation,
-        torch_dtype=torch_dtype,
-        use_cache=False if training_args.gradient_checkpointing else True,
-    )
-    training_args.model_init_kwargs = model_kwargs
-
-    ################
     #  Initialize the PPO trainer
     ################
     trainer = PPOTrainer(
         args=training_args,
-        policy_model=model_args.model_name_or_path,
-        ref_model=model_args.model_name_or_path,
-        value_model=model_args.model_name_or_path,
+        policy_model=policy_model,
+        ref_model=ref_model,
+        value_model=value_model,
         reward_funcs=reward_funcs,
         reward_func_names=reward_func_names,
         train_dataset=dataset[script_args.dataset_train_split],

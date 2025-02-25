@@ -1,3 +1,17 @@
+# Copyright 2025 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import gc
 import math
 import os
@@ -5,39 +19,36 @@ import textwrap
 import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
-from typing import Callable, List, Optional, Union
+from typing import Optional, Union
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from accelerate import Accelerator
-from accelerate.utils import broadcast, gather, gather_object, is_peft_model
+from accelerate.utils import broadcast, gather_object
 from datasets import Dataset
 from torch.utils.data import DataLoader
-from transformers import (AutoTokenizer, BaseImageProcessor,
-                          DataCollatorWithPadding, FeatureExtractionMixin,
-                          GenerationConfig, PreTrainedModel,
+from transformers import (BaseImageProcessor, DataCollatorWithPadding,
+                          FeatureExtractionMixin, GenerationConfig,
                           PreTrainedTokenizerBase, ProcessorMixin, Trainer,
                           TrainerCallback, TrainerControl, is_wandb_available)
 from transformers.integrations import get_reporting_integration_callbacks
 from transformers.trainer import DEFAULT_CALLBACKS, DEFAULT_PROGRESS_CALLBACK
 from transformers.trainer_callback import (CallbackHandler, ExportableState,
                                            PrinterCallback)
-from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers.utils import is_peft_available
-from trl.core import masked_mean, masked_whiten
-from trl.data_utils import is_conversational, maybe_apply_chat_template
-from trl.models import create_reference_model
-from trl.models.utils import unwrap_model_for_generation
-from trl.trainer.utils import (
-    OnlineTrainerState, batch_generation, disable_dropout_in_model, exact_div,
-    first_true_indices, forward, generate_model_card, get_comet_experiment_url,
-    get_reward, log_table_to_comet_experiment, peft_module_casting_to_bf16,
-    prepare_deepspeed, print_rich_table, truncate_response)
 
-from openr1.train.ppo.configs import PPOConfig
-from openr1.utils.utils import selective_log_softmax
+from ..core import masked_mean, masked_whiten
+from ..models import create_reference_model
+from ..models.utils import unwrap_model_for_generation
+from .ppo_config import PPOConfig
+from .utils import (OnlineTrainerState, batch_generation,
+                    disable_dropout_in_model, exact_div, first_true_indices,
+                    forward, generate_model_card, get_comet_experiment_url,
+                    get_reward, log_table_to_comet_experiment,
+                    peft_module_casting_to_bf16, prepare_deepspeed,
+                    print_rich_table, selective_log_softmax, truncate_response)
 
 if is_peft_available():
     from peft import PeftConfig, PeftModel, get_peft_model
@@ -46,10 +57,6 @@ if is_wandb_available():
     import wandb
 
 INVALID_LOGPROB = 1.0
-
-# What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
-# rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
-RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
 
 # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
@@ -75,38 +82,36 @@ class PPOTrainer(Trainer):
     def __init__(
         self,
         args: PPOConfig,
-        policy_model: Union[nn.Module, PreTrainedModel],
-        ref_model: Optional[Union[nn.Module, PreTrainedModel]],
-        value_model: Optional[Union[nn.Module, PreTrainedModel]],
-        reward_funcs: RewardFunc,
-        reward_func_names: List[str],
         processing_class: Optional[Union[PreTrainedTokenizerBase,
                                          BaseImageProcessor,
                                          FeatureExtractionMixin,
                                          ProcessorMixin]],
-        reward_processing_classes: Optional[Union[
-            PreTrainedTokenizerBase, list[PreTrainedTokenizerBase]]] = None,
-        train_dataset: Dataset = None,
-        eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
+        model: nn.Module,
+        ref_model: Optional[nn.Module],
+        reward_model: nn.Module,
+        train_dataset: Dataset,
+        value_model: Optional[nn.Module] = None,
         data_collator: Optional[DataCollatorWithPadding] = None,
+        eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
         # less commonly used
         optimizers: tuple[torch.optim.Optimizer,
                           torch.optim.lr_scheduler.LambdaLR] = (None, None),
         callbacks: Optional[list[TrainerCallback]] = None,
         peft_config: Optional['PeftConfig'] = None,
     ) -> None:
-        if ref_model is policy_model:
+        if ref_model is model:
             raise ValueError(
                 '`model` and `ref_model` cannot be the same object. If you want `ref_model` to be the '
                 'same as `model`, you must make a copy of it, or `None` if you use peft.'
             )
-        self.args = args
-        accelerator = Accelerator(
-            gradient_accumulation_steps=args.gradient_accumulation_steps)
-        self.accelerator = accelerator
 
+        self.args = args
         self.processing_class = processing_class
-        self.policy_model = policy_model
+        self.policy_model = model
+
+        # Define the collator if not provided
+        if data_collator is None:
+            data_collator = DataCollatorWithPadding(self.processing_class)
 
         # Handle stop token settings: update policy model's generation_config to use provided stop token
         if args.stop_token and args.stop_token_id:
@@ -150,67 +155,14 @@ class PPOTrainer(Trainer):
         else:
             self.ref_model = create_reference_model(self.policy_model)
 
-        # Value Model
-        self.value_model = value_model
-
-        # Reward functions
-        if not isinstance(reward_funcs, list):
-            reward_funcs = [reward_funcs]
-        for i, reward_func in enumerate(reward_funcs):
-            if isinstance(reward_func, PreTrainedModel):
-                reward_funcs[i] = reward_func
-        self.reward_funcs = reward_funcs
-        self.reward_func_names = reward_func_names
-
-        # Reward weights
-        if args.reward_weights is not None:
-            if len(args.reward_weights) != len(reward_funcs):
-                raise ValueError(
-                    f'Number of reward weights ({len(args.reward_weights)}) must match number of reward '
-                    f'functions ({len(reward_funcs)})')
-            self.reward_weights = torch.tensor(args.reward_weights,
-                                               dtype=torch.float32)
-        else:
-            self.reward_weights = torch.ones(len(reward_funcs),
-                                             dtype=torch.float32)
-
-        # Reward processing class
-        if reward_processing_classes is None:
-            reward_processing_classes = [None] * len(reward_funcs)
-        elif not isinstance(reward_processing_classes, list):
-            reward_processing_classes = [reward_processing_classes]
-        else:
-            if len(reward_processing_classes) != len(reward_funcs):
-                raise ValueError(
-                    'The number of reward processing classes must match the number of reward functions.'
-                )
-
-        for i, (reward_processing_class, reward_func) in enumerate(
-                zip(reward_processing_classes, reward_funcs)):
-            if isinstance(reward_func, PreTrainedModel):
-                if reward_processing_class is None:
-                    reward_processing_class = AutoTokenizer.from_pretrained(
-                        reward_func.config._name_or_path)
-                if reward_processing_class.pad_token_id is None:
-                    reward_processing_class.pad_token = (
-                        reward_processing_class.eos_token)
-                # The reward model computes the reward for the latest non-padded token in the input sequence.
-                # So it's important to set the pad token ID to the padding token ID of the processing class.
-                reward_func.config.pad_token_id = reward_processing_class.pad_token_id
-                reward_processing_classes[i] = reward_processing_class
-        self.reward_processing_classes = reward_processing_classes
-
-        # train dataset and eval dataset
+        self.reward_model = reward_model
         self.train_dataset = train_dataset
         self.train_dataset_len = len(train_dataset)
-        self.eval_dataset = eval_dataset
+        self.value_model = value_model
         self.data_collator = data_collator
+        self.eval_dataset = eval_dataset
         self.optimizer, self.lr_scheduler = optimizers
         self.optimizer_cls_and_kwargs = None  # needed for transformers >= 4.47
-
-        # Data collator
-        def data_collator(features):  # No data collation is needed in GRPO
-            return features
 
         #########
         # calculate various batch sizes
@@ -218,6 +170,9 @@ class PPOTrainer(Trainer):
         if args.total_episodes is None:  # allow the users to define episodes in terms of epochs.
             args.total_episodes = int(args.num_train_epochs *
                                       self.train_dataset_len)
+        accelerator = Accelerator(
+            gradient_accumulation_steps=args.gradient_accumulation_steps)
+        self.accelerator = accelerator
         args.world_size = accelerator.num_processes
         args.local_batch_size = (args.per_device_train_batch_size *
                                  args.gradient_accumulation_steps *
@@ -232,9 +187,9 @@ class PPOTrainer(Trainer):
             args.local_batch_size, args.num_mini_batches,
             '`local_batch_size` must be a multiple of `num_mini_batches`')
         if args.whiten_rewards:
-            assert (
-                args.local_mini_batch_size >= 8
-            ), f'Per-rank minibatch size {args.local_mini_batch_size} is insufficient for whitening'
+            assert args.local_mini_batch_size >= 8, (
+                f'Per-rank minibatch size {args.local_mini_batch_size} is insufficient for whitening'
+            )
         # `per_rank_rollout_batch_size` is our `args.local_batch_size`
         # `per_rank_minibatch_size` is our `args.local_mini_batch_size`
         args.num_total_batches = math.ceil(
@@ -255,18 +210,11 @@ class PPOTrainer(Trainer):
         # setup model, optimizer, and others
         #########
         for module in [
-                self.policy_model,
-                self.ref_model,
-                self.value_model,
+                self.policy_model, self.ref_model, self.value_model,
+                self.reward_model
         ]:
-
             if module is not None:
                 disable_dropout_in_model(module)
-
-        for i, reward_func in enumerate(self.reward_funcs):
-            if isinstance(reward_func, nn.Module):
-                disable_dropout_in_model(module)
-
         self.model = PolicyAndValueWrapper(self.policy_model, self.value_model)
         self.model.config = self.policy_model.config  # needed for pushing to hub
         self.create_optimizer_and_scheduler(
@@ -274,7 +222,7 @@ class PPOTrainer(Trainer):
         )  # note that we are calling `self.lr_scheduler.step()` manually only at the batch level
 
         #########
-        # trainer specifics
+        ### trainer specifics
         #########
         default_callbacks = DEFAULT_CALLBACKS + get_reporting_integration_callbacks(
             self.args.report_to)
@@ -313,7 +261,7 @@ class PPOTrainer(Trainer):
             self.model.add_model_tags(self._tag_names)
 
         #########
-        # setup dataloader
+        ### setup dataloader
         #########
         self.dataloader = DataLoader(
             self.train_dataset,
@@ -328,12 +276,6 @@ class PPOTrainer(Trainer):
         torch.manual_seed(args.seed)
         self.model, self.optimizer, self.dataloader = accelerator.prepare(
             self.model, self.optimizer, self.dataloader)
-
-        for i, reward_func in enumerate(self.reward_funcs):
-            if isinstance(reward_func, nn.Module):
-                self.reward_funcs[i] = self.accelerator.prepare_model(
-                    reward_func, evaluation_mode=True)
-
         torch.manual_seed(self.local_seed)  # reset the local seed again
 
         self.eval_dataloader = DataLoader(
@@ -345,11 +287,9 @@ class PPOTrainer(Trainer):
         self.eval_dataloader = accelerator.prepare(self.eval_dataloader)
 
         if self.is_deepspeed_enabled:
-            for i, reward_func in enumerate(self.reward_funcs):
-                if isinstance(reward_func, nn.Module):
-                    self.reward_funcs[i] = prepare_deepspeed(
-                        reward_func, args.per_device_train_batch_size,
-                        args.fp16, args.bf16)
+            self.reward_model = prepare_deepspeed(
+                self.reward_model, args.per_device_train_batch_size, args.fp16,
+                args.bf16)
 
             if self.ref_model is None:
                 if not self.is_peft_model:
@@ -366,38 +306,13 @@ class PPOTrainer(Trainer):
                         'No reference model and model is not a Peft model.')
             else:
                 self.ref_model = self.ref_model.to(self.accelerator.device)
-                for i, reward_func in enumerate(self.reward_funcs):
-                    if isinstance(reward_func, nn.Module):
-                        self.reward_funcs[i] = reward_func.to(
-                            self.accelerator.device)
+            self.reward_model = self.reward_model.to(self.accelerator.device)
 
     def get_train_dataloader(self) -> DataLoader:
         return self.dataloader
 
     def get_eval_dataloader(self) -> DataLoader:
         return self.eval_dataloader
-
-    def _enable_gradient_checkpointing(self, model: PreTrainedModel,
-                                       args: PPOConfig) -> PreTrainedModel:
-        """Enables gradient checkpointing for the model."""
-        # Ensure use_cache is disabled
-        model.config.use_cache = False
-
-        # Enable gradient checkpointing on the base model for PEFT
-        if is_peft_model(model):
-            model.base_model.gradient_checkpointing_enable()
-        # Enable gradient checkpointing for non-PEFT models
-        else:
-            model.gradient_checkpointing_enable()
-
-        gradient_checkpointing_kwargs = args.gradient_checkpointing_kwargs or {}
-        use_reentrant = ('use_reentrant' not in gradient_checkpointing_kwargs
-                         or gradient_checkpointing_kwargs['use_reentrant'])
-
-        if use_reentrant:
-            model.enable_input_require_grads()
-
-        return model
 
     @contextmanager
     def null_ref_context(self):
@@ -436,6 +351,7 @@ class PPOTrainer(Trainer):
         optimizer = self.optimizer
         model = self.model
         ref_policy = self.ref_model
+        reward_model = self.reward_model
         processing_class = self.processing_class
         dataloader = self.dataloader
         device = accelerator.device
@@ -501,30 +417,8 @@ class PPOTrainer(Trainer):
         for update in range(1, args.num_total_batches + 1):
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)
-            prompts = [x['prompt'] for x in data]
             with torch.no_grad():
-                prompts_text = [
-                    maybe_apply_chat_template(example,
-                                              self.processing_class)['prompt']
-                    for example in data
-                ]
-                keys = [
-                    key for key in data[0]
-                    if key not in ['prompt', 'completion']
-                ]
-                extra_data = {
-                    key: [example[key] for example in data]
-                    for key in keys
-                }
-                query_inputs = self.processing_class(prompts_text,
-                                                     return_tensors='pt',
-                                                     padding=True,
-                                                     padding_side='left',
-                                                     add_special_tokens=False)
-                query_inputs = super()._prepare_inputs(query_inputs)
-                queries, query_mask = query_inputs['input_ids'], query_inputs[
-                    'attention_mask']
-
+                queries = data['input_ids'].to(device)
                 context_length = queries.shape[1]
                 responses = []
                 postprocessed_responses = []
@@ -533,10 +427,6 @@ class PPOTrainer(Trainer):
                 scores = []
                 sequence_lengths = []
                 values = []
-                reward_func_metrics = {}
-                for i, func_name in enumerate(self.reward_func_names):
-                    reward_func_metrics[func_name] = []
-
                 with unwrap_model_for_generation(
                         self.model,
                         self.accelerator,
@@ -552,15 +442,6 @@ class PPOTrainer(Trainer):
 
                 for i in range(0, queries.shape[0],
                                args.local_rollout_forward_batch_size):
-
-                    prompts_batch = prompts[i:i + args.
-                                            local_rollout_forward_batch_size]
-                    reward_extra_data = {
-                        key:
-                        extra_data[key][i:i +
-                                        args.local_rollout_forward_batch_size]
-                        for key in extra_data
-                    }
                     query = queries[i:i +
                                     args.local_rollout_forward_batch_size]
                     query_response = query_responses[
@@ -604,70 +485,10 @@ class PPOTrainer(Trainer):
                         unwrapped_value_model, query_response,
                         processing_class.pad_token_id, context_length)
                     value = full_value[:, context_length - 1:-1].squeeze(-1)
-
-                    # Decode the generated completions
-                    completions_text = self.processing_class.batch_decode(
-                        postprocessed_response, skip_special_tokens=True)
-                    query_text = self.processing_class.batch_decode(
-                        query, skip_special_tokens=True)
-
-                    if_conversation = is_conversational(data[0])
-                    if if_conversation:
-                        completions = []
-                        for prompt, completion in zip(prompts_batch,
-                                                      completions_text):
-                            bootstrap = prompt.pop()['content'] if prompt[-1][
-                                'role'] == 'assistant' else ''
-                            completions.append([{
-                                'role':
-                                'assistant',
-                                'content':
-                                bootstrap + completion
-                            }])
-                    else:
-                        completions = completions_text
-
-                    # Get the reward
-                    rewards_per_func = torch.zeros(len(completions),
-                                                   len(self.reward_funcs),
-                                                   device=device)
-
-                    for i, (reward_func, reward_processing_class) in enumerate(
-                            zip(self.reward_funcs,
-                                self.reward_processing_classes)):
-
-                        # Module instead of PretrainedModel for compat with compiled models
-                        if isinstance(reward_func, nn.Module):
-
-                            with torch.inference_mode():
-                                _, score, _ = get_reward(
-                                    reward_func, postprocessed_query_response,
-                                    reward_processing_class.pad_token_id,
-                                    context_length)
-                        else:
-
-                            output_reward_func = reward_func(
-                                prompts=query_text,
-                                completions=completions,
-                                **reward_extra_data)
-                            score = torch.tensor(output_reward_func,
-                                                 dtype=torch.float32,
-                                                 device=device)
-
-                        rewards_per_func[:, i] = score
-
-                    # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
-                    # completions may be distributed across processes
-                    rewards_per_func = gather(rewards_per_func)
-
-                    for i, func_name in enumerate(self.reward_func_names):
-                        reward_func_metrics[func_name].append(
-                            rewards_per_func[:, i])
-
-                    # Apply weights to each reward function's output and sum
-                    score = (rewards_per_func *
-                             self.reward_weights.to(device).unsqueeze(0)).sum(
-                                 dim=1)
+                    _, score, _ = get_reward(reward_model,
+                                             postprocessed_query_response,
+                                             processing_class.pad_token_id,
+                                             context_length)
 
                     responses.append(response)
                     postprocessed_responses.append(postprocessed_response)
@@ -676,12 +497,6 @@ class PPOTrainer(Trainer):
                     sequence_lengths.append(sequence_length)
                     scores.append(score)
                     values.append(value)
-
-                reward_func_metrics = {
-                    func_name: torch.cat(reward_func_metrics[func_name], 0)
-                    for func_name in self.reward_func_names
-                }
-
                 responses = torch.cat(responses, 0)
                 postprocessed_responses = torch.cat(postprocessed_responses, 0)
                 logprobs = torch.cat(logprobs, 0)
@@ -702,9 +517,7 @@ class PPOTrainer(Trainer):
                     dim=-1)
                 if self.args.missing_eos_penalty is not None:
                     scores[~contain_eos_token] -= self.args.missing_eos_penalty
-                accelerator.print(
-                    f'{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}'
-                )
+                # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
 
                 # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
                 response_idxs = torch.arange(responses.shape[1],
@@ -890,20 +703,10 @@ class PPOTrainer(Trainer):
                 mean_kl = kl.sum(1).mean()
                 mean_entropy = (-logprobs).sum(1).mean()
                 mean_non_score_reward = non_score_reward.sum(1).mean()
-                mean_sequence_length = sequence_lengths.float().mean()
-                mean_reward_per_func = {
-                    func_name: reward_func_metrics[func_name].mean()
-                    for func_name in self.reward_func_names
-                }
                 rlhf_reward = mean_non_score_reward + scores.mean()
                 eps = int(self.state.episode / (time.time() - start_time))
                 metrics = {}
                 metrics['eps'] = eps
-                for key, val in mean_reward_per_func.items():
-                    metrics['reward_funcs/' + str(key)] = val.item()
-                metrics[
-                    'reward_funcs/sequence_length'] = mean_sequence_length.item(
-                    )
                 metrics['objective/kl'] = self.accelerator.gather_for_metrics(
                     mean_kl).mean().item()
                 metrics[
@@ -949,11 +752,6 @@ class PPOTrainer(Trainer):
                 self.log(metrics)
 
             self.lr_scheduler.step()
-            if (update + 1) % self.args.save_steps == 0:  # save checkpoint
-                self.save_model(
-                    os.path.join(
-                        self.args.output_dir,
-                        f'{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}'))
             self.control = self.callback_handler.on_step_end(
                 args, self.state, self.control)
             if self.control.should_save:
@@ -999,7 +797,6 @@ class PPOTrainer(Trainer):
 
     def generate_completions(self, sampling: bool = False):
         args = self.args
-        device = self.accelerator.device
         processing_class = self.processing_class
         generation_config = GenerationConfig(
             max_new_tokens=self.args.response_length,
@@ -1016,29 +813,7 @@ class PPOTrainer(Trainer):
                 gather_deepspeed3_params=self.args.ds3_gather_for_generation
         ) as unwrapped_model:
             for batch in self.eval_dataloader:
-                prompts = [x['prompt'] for x in batch]
-                prompts_text = [
-                    maybe_apply_chat_template(example,
-                                              self.processing_class)['prompt']
-                    for example in batch
-                ]
-                keys = [
-                    key for key in batch[0]
-                    if key not in ['prompt', 'completion']
-                ]
-                extra_data = {
-                    key: [example[key] for example in batch]
-                    for key in keys
-                }
-                query_inputs = self.processing_class(prompts_text,
-                                                     return_tensors='pt',
-                                                     padding=True,
-                                                     padding_side='left',
-                                                     add_special_tokens=False)
-                query_inputs = super()._prepare_inputs(query_inputs)
-                query, query_mask = query_inputs['input_ids'], query_inputs[
-                    'attention_mask']
-
+                query = batch['input_ids']
                 with torch.no_grad():
                     context_length = query.shape[1]
                     query_response, _ = batch_generation(
@@ -1065,66 +840,10 @@ class PPOTrainer(Trainer):
 
                     postprocessed_query_response = torch.cat(
                         (query, postprocessed_response), 1)
-
-                    # Decode the generated completions
-                    completions_text = self.processing_class.batch_decode(
-                        postprocessed_response, skip_special_tokens=True)
-                    query_text = self.processing_class.batch_decode(
-                        query, skip_special_tokens=True)
-
-                    if_conversation = is_conversational(batch[0])
-                    if if_conversation:
-                        completions = []
-                        for prompt, completion in zip(prompts,
-                                                      completions_text):
-                            bootstrap = prompt.pop()['content'] if prompt[-1][
-                                'role'] == 'assistant' else ''
-                            completions.append([{
-                                'role':
-                                'assistant',
-                                'content':
-                                bootstrap + completion
-                            }])
-                    else:
-                        completions = completions_text
-
-                    rewards_per_func = torch.zeros(len(completions),
-                                                   len(self.reward_funcs),
-                                                   device=device)
-
-                    for i, (reward_func, reward_processing_class) in enumerate(
-                            zip(self.reward_funcs,
-                                self.reward_processing_classes)):
-                        if isinstance(reward_func, nn.Module):
-                            # Module instead of PretrainedModel for compat with compiled models
-
-                            with torch.inference_mode():
-                                _, score, _ = get_reward(
-                                    reward_func, postprocessed_query_response,
-                                    reward_processing_class.pad_token_id,
-                                    context_length)
-
-                        else:
-                            # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-                            output_reward_func = reward_func(
-                                prompts=query_text,
-                                completions=completions,
-                                **extra_data)
-                            score = torch.tensor(output_reward_func,
-                                                 dtype=torch.float32,
-                                                 device=device)
-
-                        rewards_per_func[:, i] = score
-
-                    # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
-                    # completions may be distributed across processes
-                    rewards_per_func = gather(rewards_per_func)
-
-                    # Apply weights to each reward function's output and sum
-                    score = (rewards_per_func *
-                             self.reward_weights.to(device).unsqueeze(0)).sum(
-                                 dim=1)
-
+                    _, score, _ = get_reward(self.reward_model,
+                                             postprocessed_query_response,
+                                             processing_class.pad_token_id,
+                                             context_length)
                     table['score'].extend(
                         self.accelerator.gather_for_metrics(
                             score).float().cpu().numpy())
