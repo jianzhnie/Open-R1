@@ -231,6 +231,8 @@ def main(script_args: PPOScriptArguments, training_args: PPOConfig,
     trainer = PPOTrainer(
         args=training_args,
         policy_model=model_args.model_name_or_path,
+        ref_model=model_args.model_name_or_path,
+        value_model=model_args.model_name_or_path,
         reward_funcs=reward_funcs,
         reward_func_names=reward_func_names,
         train_dataset=dataset[script_args.dataset_train_split],

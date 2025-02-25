@@ -57,10 +57,6 @@ class TrlPPOConfig(OnPolicyConfig):
             'argument of the `GRPOTrainer` is provided as a string.'
         },
     )
-    value_model_path: str = field(
-        default='EleutherAI/pythia-160m',
-        metadata={'help': 'Path to the reward model.'},
-    )
     model_adapter_name: Optional[str] = field(
         default=None,
         metadata={

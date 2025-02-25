@@ -103,7 +103,7 @@ class PPOTrainer(Trainer):
         # Trained model
         model_init_kwargs = args.model_init_kwargs or {}
         if isinstance(policy_model, str):
-            model_id = policy_model
+            model_name_or_path = policy_model
             torch_dtype = model_init_kwargs.get('torch_dtype')
             if (isinstance(torch_dtype, torch.dtype) or torch_dtype == 'auto'
                     or torch_dtype is None):
@@ -123,7 +123,7 @@ class PPOTrainer(Trainer):
             self.policy_model = AutoModelForCausalLM.from_pretrained(
                 policy_model, **model_init_kwargs)
         else:
-            model_id = policy_model.config._name_or_path
+            model_name_or_path = policy_model.config._name_or_path
             if args.model_init_kwargs is not None:
                 raise ValueError(
                     'You passed `model_init_kwargs` to the `PPOConfig`, but your model is already instantiated. '
@@ -170,14 +170,13 @@ class PPOTrainer(Trainer):
         self.ref_adapter_name = args.ref_adapter_name
 
         # Reference model
-        self.ref_model = ref_model
         self.kl_coef = args.kl_coef
         if self.kl_coef == 0.0:
             # If beta is 0.0, the reference model is not needed
             self.ref_model = None
         elif is_deepspeed_zero3_enabled():
             self.ref_model = AutoModelForCausalLM.from_pretrained(
-                model_id, **model_init_kwargs)
+                model_name_or_path, **model_init_kwargs)
         elif is_peft_model:
             # If PEFT is used, the reference model is not needed since the adapter can be disabled
             # to revert to the initial model.
@@ -186,12 +185,9 @@ class PPOTrainer(Trainer):
             # If PEFT configuration is not provided, create a reference model based on the initial model.
             self.ref_model = create_reference_model(self.policy_model)
 
-        # Vlaue Model
-        if args.value_model_path:
-            self.value_model = AutoModelForSequenceClassification.from_pretrained(
-                args.value_model_path,
-                trust_remote_code=model_init_kwargs.trust_remote_code,
-                num_labels=1)
+        # Value Model
+        self.value_model = AutoModelForSequenceClassification.from_pretrained(
+            model_name_or_path, **model_init_kwargs, num_labels=1)
 
         # Reward functions
         if not isinstance(reward_funcs, list):
@@ -247,7 +243,6 @@ class PPOTrainer(Trainer):
                 reward_processing_classes[i] = reward_processing_class
         self.reward_processing_classes = reward_processing_classes
 
-        self.value_model = value_model
         self.train_dataset = train_dataset
         self.train_dataset_len = len(train_dataset)
         self.eval_dataset = eval_dataset

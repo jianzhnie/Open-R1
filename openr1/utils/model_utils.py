@@ -4,13 +4,14 @@ from transformers import AutoTokenizer, PreTrainedTokenizer
 from trl import ModelConfig
 
 from openr1.train.grpo.configs import GRPOConfig
+from openr1.train.ppo.configs import PPOConfig
 from openr1.train.sft.configs import SFTConfig
 
 DEFAULT_CHAT_TEMPLATE = "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}"
 
 
 def get_tokenizer(model_args: ModelConfig,
-                  training_args: Union[SFTConfig, GRPOConfig],
+                  training_args: Union[SFTConfig, GRPOConfig, PPOConfig],
                   auto_set_chat_template: bool = True) -> PreTrainedTokenizer:
     """Get the tokenizer for the model."""
     tokenizer = AutoTokenizer.from_pretrained(
@@ -18,10 +19,11 @@ def get_tokenizer(model_args: ModelConfig,
         revision=model_args.model_revision,
         trust_remote_code=model_args.trust_remote_code,
     )
-
-    if training_args.chat_template is not None:
-        tokenizer.chat_template = training_args.chat_template
-    elif auto_set_chat_template and tokenizer.get_chat_template() is None:
-        tokenizer.chat_template = DEFAULT_CHAT_TEMPLATE
-
+    try:
+        if training_args.chat_template is not None:
+            tokenizer.chat_template = training_args.chat_template
+        elif auto_set_chat_template and tokenizer.get_chat_template() is None:
+            tokenizer.chat_template = DEFAULT_CHAT_TEMPLATE
+    except:
+        pass
     return tokenizer
