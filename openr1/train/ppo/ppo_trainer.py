@@ -200,6 +200,10 @@ class PPOTrainer(Trainer):
                 reward_processing_classes[i] = reward_processing_class
         self.reward_processing_classes = reward_processing_classes
 
+        # Data collator
+        def data_collator(features):  # No data collation is needed in GRPO
+            return features
+
         # train dataset and eval dataset
         self.train_dataset = train_dataset
         self.train_dataset_len = len(train_dataset)
@@ -207,10 +211,6 @@ class PPOTrainer(Trainer):
         self.data_collator = data_collator
         self.optimizer, self.lr_scheduler = optimizers
         self.optimizer_cls_and_kwargs = None  # needed for transformers >= 4.47
-
-        # Data collator
-        def data_collator(features):  # No data collation is needed in GRPO
-            return features
 
         #########
         # calculate various batch sizes

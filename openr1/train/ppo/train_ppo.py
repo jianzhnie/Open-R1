@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 import datasets
 import torch
 import transformers
-from accelerate import PartialState
 from datasets import load_dataset
 from transformers import (AutoModelForCausalLM,
                           AutoModelForSequenceClassification, AutoTokenizer)
@@ -232,17 +231,15 @@ def main(script_args: PPOScriptArguments, training_args: PPOConfig,
         ]
         return {'prompt': prompt}
 
-    # Compute that only on the main process for faster data processing.
-    # see: https://github.com/huggingface/trl/pull/1255
-    with PartialState().local_main_process_first():
-        # 处理数据集 - 修复这里的调用
-        dataset = dataset.map(
-            function=make_conversation,
-            desc='Processing dataset, convert to `conversation` formate',
-        )
+    # 处理数据集 - 修复这里的调用
+    dataset = dataset.map(
+        function=make_conversation,
+        desc='Processing dataset, convert to `conversation` formate',
+    )
     for split in dataset:
         if 'messages' in dataset[split].column_names:
-            dataset[split] = dataset[split].remove_columns(['messages', 'problem'])
+            dataset[split] = dataset[split].remove_columns(
+                ['messages', 'problem'])
 
     # 打印处理后的样本示例
     logger.info('\nProcessed example:')
