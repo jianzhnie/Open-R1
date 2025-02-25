@@ -16,6 +16,7 @@ sys.path.append(os.getcwd())
 
 from openr1.train.ppo.configs import PPOConfig
 from openr1.train.ppo.ppo_trainer import PPOTrainer
+from openr1.utils.model_utils import DEFAULT_CHAT_TEMPLATE
 from openr1.utils.reward_funcs import (accuracy_reward, code_reward,
                                        format_reward, get_code_format_reward,
                                        get_cosine_scaled_reward,
@@ -138,6 +139,9 @@ def main(script_args: PPOScriptArguments, training_args: PPOConfig,
         revision=model_args.model_revision,
         trust_remote_code=model_args.trust_remote_code,
     )
+    if tokenizer.chat_template is None:
+        tokenizer.chat_template = DEFAULT_CHAT_TEMPLATE
+
     torch_dtype = (model_args.torch_dtype if model_args.torch_dtype in [
         'auto', None
     ] else getattr(torch, model_args.torch_dtype))
