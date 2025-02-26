@@ -696,15 +696,7 @@ class PPOTrainer(Trainer):
 
                 # Response Processing 3. Filter completion. Ensure that the sample contains stop_token_id
                 # Completions not passing that filter will receive a lower score.
-                contain_eos_token = torch.any(
-                    postprocessed_responses ==
-                    self.processing_class.eos_token_id,
-                    dim=-1)
-                if self.args.missing_eos_penalty is not None:
-                    scores[~contain_eos_token] -= self.args.missing_eos_penalty
-                accelerator.print(
-                    f'{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}'
-                )
+                accelerator.print(f'scores: {scores} ')
 
                 # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
                 response_idxs = torch.arange(responses.shape[1],
@@ -724,11 +716,8 @@ class PPOTrainer(Trainer):
                 kl = logprobs - ref_logprobs
                 non_score_reward = -args.kl_coef * kl
                 rewards = non_score_reward.clone()
-                actual_start = torch.arange(rewards.size(0),
-                                            device=rewards.device)
-                actual_end = torch.where(sequence_lengths_p1 < rewards.size(1),
-                                         sequence_lengths_p1, sequence_lengths)
-                rewards[[actual_start, actual_end]] += scores
+                # 直接通过切片实现广播，无需显式调整形状
+                rewards += scores[:, None]
 
                 # 5. whiten rewards
                 if args.whiten_rewards:
@@ -976,14 +965,11 @@ class PPOTrainer(Trainer):
                 ref_logprobs,
                 values,
                 sequence_lengths,
-                contain_eos_token,
                 sequence_lengths_p1,
                 response_idxs,
                 padding_mask,
                 padding_mask_p1,
                 rewards,
-                actual_start,
-                actual_end,
                 advantages,
                 returns,
             )
