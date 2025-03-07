@@ -1,11 +1,22 @@
 import json
 import math
+import os
 import re
-from typing import Dict, List, Set, Tuple, Union
+import sys
+from typing import Callable, Dict, List, Sequence, Set, Tuple, Union
 
 from latex2sympy2_extended import NormalizationConfig
-from math_verify import LatexExtractionConfig, parse, verify
+from math_verify.grader import verify
+from math_verify.parser import (ExprExtractionConfig, ExtractionTarget,
+                                LatexExtractionConfig, parse)
 from transformers.utils.import_utils import _is_package_available
+
+sys.path.append(os.getcwd())
+
+from openr1.utils.logger_utils import get_logger
+
+# 创建 Logger
+logger = get_logger(__name__)
 
 # Use same as transformers.utils.import_utils
 _e2b_available = _is_package_available('e2b')
@@ -59,10 +70,10 @@ class MathAccuracyReward(BaseRewardFunction):
         List[float]: Reward scores between 0.0 and 1.0.
     """
 
-    def __init__(self):
+    def __init__(self, gold_is_latex: bool = True):
         """Initializes the MathAccuracyReward function with parsing
         configurations."""
-        self.latex_config = [
+        self.gold_extration_config = (
             LatexExtractionConfig(
                 normalization_config=NormalizationConfig(
                     nits=False,
@@ -74,8 +85,8 @@ class MathAccuracyReward(BaseRewardFunction):
                 ),
                 boxed_match_priority=0,
                 try_extract_without_anchor=False,
-            )
-        ]
+            ))
+        self.gold_is_latex = gold_is_latex
 
     def parse_expression(self, expression: str,
                          extraction_config: List[LatexExtractionConfig]):
@@ -95,7 +106,8 @@ class MathAccuracyReward(BaseRewardFunction):
                          extraction_mode='first_match',
                          extraction_config=extraction_config)
         except Exception as e:
-            print(f'Parsing failed for expression: {expression}, Error: {e}')
+            logger.info(
+                f'Parsing failed for expression: {expression}, Error: {e}')
             return None
 
     def __call__(self, completions: List[str], solution: List[str],
@@ -116,12 +128,12 @@ class MathAccuracyReward(BaseRewardFunction):
 
             if gold_parsed is None:
                 # Assign neutral reward if the ground truth cannot be parsed
-                print(f'Warning: Failed to parse gold solution: {sol}')
+                logger.info(f'Warning: Failed to parse gold solution: {sol}')
                 rewards.append(0.5)
                 continue
 
             answer_parsed = self.parse_expression(
-                content, extraction_config=self.latex_config)
+                content, extraction_config=self.gold_extration_config)
 
             if answer_parsed is None:
                 rewards.append(0.0)  # Invalid model response
@@ -131,7 +143,89 @@ class MathAccuracyReward(BaseRewardFunction):
                 # If the verification function succeeds, return the verification score (1.0 or 0.0)
                 reward = float(verify(answer_parsed, gold_parsed))
             except Exception as e:
-                print(
+                logger.info(
+                    f'Verification failed: {e}, Answer: {answer_parsed}, Gold: {gold_parsed}'
+                )
+                reward = 0.0
+
+            rewards.append(reward)
+
+        return rewards
+
+
+class MathAccuracyRewardV2(BaseRewardFunction):
+
+    def __init__(self, gold_is_latex: bool = True, **kwargs):
+        super().__init__(**kwargs)
+
+        self.gold_extraction_config: Sequence[ExtractionTarget] = (
+            LatexExtractionConfig()
+            if gold_is_latex else ExprExtractionConfig(), )
+        self.pred_extraction_config: Sequence[ExtractionTarget] = (
+            ExprExtractionConfig(), LatexExtractionConfig())
+
+        self.aggregation_function: Callable[[list[float]], float] = max
+        self.precision: int = 6
+
+    def parse_expression(self, expression: str,
+                         extraction_config: Sequence[ExtractionTarget]):
+        """Parses a mathematical expression using latex2sympy2.
+
+        Args:
+            expression (str): The input mathematical expression in LaTeX.
+
+        Returns:
+            Parsed expression object or None if parsing fails.
+        """
+        if not expression.strip():
+            return None  # Avoid parsing empty strings
+
+        try:
+            return parse(expression, extraction_config=extraction_config)
+        except Exception as e:
+            logger.info(
+                f'Parsing failed for expression: {expression}, Error: {e}')
+            return None
+
+    def __call__(self, completions: List[str], solution: List[str],
+                 **kwargs) -> List[float]:
+        """Computes accuracy-based rewards for mathematical expressions.
+
+        Args:
+            completions (List[str]): Model-generated responses.
+            solution (List[str]): Ground truth solutions.
+
+        Returns:
+            List[float]: Rewards based on correctness.
+        """
+        rewards = []
+        for content, sol in zip(completions, solution):
+            gold_parsed = self.parse_expression(
+                sol, extraction_config=self.gold_extraction_config)
+
+            answer_parsed = self.parse_expression(
+                content, extraction_config=self.pred_extraction_config)
+
+            if gold_parsed is None:
+                # Assign neutral reward if the ground truth cannot be parsed
+                logger.info(f'Warning: Failed to parse gold solution: {sol}')
+                reward = 0.5
+                rewards.append(reward)
+                continue
+
+            if answer_parsed is None:
+                reward = 0.0
+                rewards.append(reward)
+                continue
+
+            try:
+                # If the verification function succeeds, return the verification score (1.0 or 0.0)
+                reward = self.aggregation_function([(1.0 if any(
+                    verify(gold, pred, self.precision)
+                    for gold in gold_parsed) else 0.0)
+                                                    for pred in answer_parsed])
+            except Exception as e:
+                logger.info(
                     f'Verification failed: {e}, Answer: {answer_parsed}, Gold: {gold_parsed}'
                 )
                 reward = 0.0
@@ -369,7 +463,7 @@ class LengthReward(BaseRewardFunction):
             if not gold_parsed:
                 # Treat as correct to avoid penalization when parsing fails
                 correctness.append(True)
-                print(f'Failed to parse gold solution: {sol}')
+                logger.info(f'Failed to parse gold solution: {sol}')
                 continue
 
             answer_parsed = parse(
@@ -462,7 +556,7 @@ class CosineScaledReward(BaseRewardFunction):
         self.min_value_correct = cosine_min_value_correct
         self.max_value_correct = cosine_max_value_correct
         self.max_len = cosine_max_len
-        self.accuracy_orm = accuracy_orm or MathAccuracyReward()
+        self.accuracy_orm = accuracy_orm or MathAccuracyRewardV2()
 
     @staticmethod
     def cosine_scaled_reward(t: int, T: int, min_value: float,
@@ -674,7 +768,7 @@ class CodeReward(BaseRewardFunction):
                         output = 0.0
                     rewards.append(output)
         except Exception as e:
-            print(f'Error from E2B executor: {e}')
+            logger.info(f'Error from E2B executor: {e}')
             rewards = [0.0] * len(completions)
         return rewards
 
@@ -749,7 +843,7 @@ def test_cosine_scaled_reward_behavior() -> None:
         cosine_rewards.append(reward)
 
     for (content, reward) in zip(all_contents, cosine_rewards):
-        print(f'content: {content}, reward: {reward}')
+        logger.info(f'content: {content}, reward: {reward}')
 
     # Assertions to verify expected reward behavior
     assert cosine_rewards[0] > cosine_rewards[1] > cosine_rewards[
@@ -757,8 +851,31 @@ def test_cosine_scaled_reward_behavior() -> None:
     assert cosine_rewards[3] < cosine_rewards[4] < cosine_rewards[
         5], 'Incorrect answers should receive decreasing penalties as length increases.'
 
-    print('All tests passed successfully!')
+    logger.info('All tests passed successfully!')
+
+
+def demonstrate_rewards():
+    """演示不同情况下的奖励计算."""
+    reward_fn = CosineScaledReward()
+
+    # 测试用例
+    examples = [('so that x == 1 or x == 2, thus the result is $2*\pi*r$',
+                 '$2*\pi*r$'), ('The answer is $$\sin(x)$$', '$$\sin(x)$$'),
+                ('After solving, we get $1/2$', '$1/2$'),
+                ('The final result is $$(a + b)^2$$', '$(a + b)^2$'),
+                ('Therefore, $$3!$$', '$3!$'),
+                ('The point coordinates are $(1,2)$', '$(1,2)$')]
+
+    completions, solutions = zip(*examples)
+    rewards = reward_fn(list(completions), list(solutions))
+
+    logger.info('\n奖励值示例：')
+    for comp, solution, reward in zip(completions, solutions, rewards):
+        logger.info(
+            f'answer: {comp} || gold: {solution}, length: {len(comp)}, reward: {reward:.3f}\n',
+        )
 
 
 if __name__ == '__main__':
     test_cosine_scaled_reward_behavior()
+    demonstrate_rewards()
