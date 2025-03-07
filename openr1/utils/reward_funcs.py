@@ -7,8 +7,8 @@ from typing import Callable, Dict, List, Sequence, Set, Tuple, Union
 
 from latex2sympy2_extended import NormalizationConfig
 from math_verify.grader import verify
-from math_verify.parser import (ExprExtractionConfig, ExtractionTarget,
-                                LatexExtractionConfig, parse)
+from math_verify.parser import (ExprExtractionConfig, LatexExtractionConfig,
+                                parse)
 from transformers.utils.import_utils import _is_package_available
 
 sys.path.append(os.getcwd())
@@ -73,7 +73,7 @@ class MathAccuracyReward(BaseRewardFunction):
     def __init__(self, gold_is_latex: bool = True):
         """Initializes the MathAccuracyReward function with parsing
         configurations."""
-        self.gold_extration_config = (
+        self.gold_extration_config = [
             LatexExtractionConfig(
                 normalization_config=NormalizationConfig(
                     nits=False,
@@ -85,7 +85,7 @@ class MathAccuracyReward(BaseRewardFunction):
                 ),
                 boxed_match_priority=0,
                 try_extract_without_anchor=False,
-            ))
+            )]
         self.gold_is_latex = gold_is_latex
 
     def parse_expression(self, expression: str,
@@ -154,36 +154,58 @@ class MathAccuracyReward(BaseRewardFunction):
 
 
 class MathAccuracyRewardV2(BaseRewardFunction):
+    """Computes accuracy-based rewards for mathematical expressions using
+    latex2sympy2.
+
+    **Key Enhancements:**
+        - Supports both **LaTeX** and **symbolic expressions**.
+        - Uses an **aggregation function** to handle multiple parsing strategies.
+        - Adds **robust error handling** and logging.
+
+    **Reward Criteria:**
+        - ✅ 1.0 → Response is mathematically equivalent to the solution.
+        - ❌ 0.0 → Response is incorrect.
+        - 🔄 0.5 → Ground truth cannot be parsed.
+
+    **Args:**
+        completions (List[str]): Model-generated completions.
+        solution (List[str]): Ground truth solutions.
+
+    **Returns:**
+        List[float]: Reward scores between 0.0 and 1.0.
+    """
 
     def __init__(self, gold_is_latex: bool = True, **kwargs):
         super().__init__(**kwargs)
 
-        self.gold_extraction_config: Sequence[ExtractionTarget] = (
+        # Ensure extraction config is a list (not a tuple)
+        self.gold_extraction_config: Sequence = ([
             LatexExtractionConfig()
-            if gold_is_latex else ExprExtractionConfig(), )
-        self.pred_extraction_config: Sequence[ExtractionTarget] = (
-            ExprExtractionConfig(), LatexExtractionConfig())
+        ] if gold_is_latex else [ExprExtractionConfig()])
+        self.pred_extraction_config: Sequence = [
+            ExprExtractionConfig(),
+            LatexExtractionConfig()
+        ]
 
         self.aggregation_function: Callable[[list[float]], float] = max
         self.precision: int = 6
 
-    def parse_expression(self, expression: str,
-                         extraction_config: Sequence[ExtractionTarget]):
+    def parse_expression(self, expression: str, extraction_config: Sequence):
         """Parses a mathematical expression using latex2sympy2.
 
         Args:
-            expression (str): The input mathematical expression in LaTeX.
+            expression (str): The input mathematical expression.
 
         Returns:
             Parsed expression object or None if parsing fails.
         """
         if not expression.strip():
-            return None  # Avoid parsing empty strings
+            return None  # Skip empty expressions
 
         try:
             return parse(expression, extraction_config=extraction_config)
         except Exception as e:
-            logger.info(
+            logger.warning(
                 f'Parsing failed for expression: {expression}, Error: {e}')
             return None
 
@@ -203,29 +225,30 @@ class MathAccuracyRewardV2(BaseRewardFunction):
             gold_parsed = self.parse_expression(
                 sol, extraction_config=self.gold_extraction_config)
 
+            if not gold_parsed:
+                # Assign neutral reward if the ground truth cannot be parsed
+                logger.warning(f'Failed to parse ground truth solution: {sol}')
+                rewards.append(0.5)
+                continue
+
             answer_parsed = self.parse_expression(
                 content, extraction_config=self.pred_extraction_config)
 
-            if gold_parsed is None:
-                # Assign neutral reward if the ground truth cannot be parsed
-                logger.info(f'Warning: Failed to parse gold solution: {sol}')
-                reward = 0.5
-                rewards.append(reward)
-                continue
-
-            if answer_parsed is None:
-                reward = 0.0
-                rewards.append(reward)
+            if not answer_parsed:
+                # Penalize unparseable model outputs
+                rewards.append(0.0)
                 continue
 
             try:
-                # If the verification function succeeds, return the verification score (1.0 or 0.0)
-                reward = self.aggregation_function([(1.0 if any(
-                    verify(gold, pred, self.precision)
-                    for gold in gold_parsed) else 0.0)
-                                                    for pred in answer_parsed])
+                # Compute reward using the aggregation function
+                reward = self.aggregation_function([
+                    1.0 if any(
+                        verify(gold, pred, self.precision)
+                        for gold in gold_parsed) else 0.0
+                    for pred in answer_parsed
+                ])
             except Exception as e:
-                logger.info(
+                logger.error(
                     f'Verification failed: {e}, Answer: {answer_parsed}, Gold: {gold_parsed}'
                 )
                 reward = 0.0
@@ -520,26 +543,29 @@ class LengthReward(BaseRewardFunction):
 
 
 class CosineScaledReward(BaseRewardFunction):
-    """Reward function that scales based on completion length using a cosine
-    schedule.
+    """Reward function that scales rewards based on completion length using a
+    cosine schedule.
 
-    Reference: https://arxiv.org/abs/2502.03373
+    **Reference**: https://arxiv.org/abs/2502.03373
 
-    Shorter correct completions receive higher rewards.
-    Longer incorrect completions receive lower penalties.
+    **Key Behavior**:
+        - ✅ Shorter **correct** completions receive **higher** rewards.
+        - ❌ Longer **incorrect** completions receive **lower** penalties.
 
-    Args:
-        cosine_min_value_wrong (float): Minimum reward for incorrect answers.
-        cosine_max_value_wrong (float): Maximum reward for incorrect answers.
-        cosine_min_value_correct (float): Minimum reward for correct answers.
-        cosine_max_value_correct (float): Maximum reward for correct answers.
-        cosine_max_len (int): Maximum length for scaling.
-        accuracy_orm (BaseRewardFunction, optional): Accuracy computation module.
+    **Args:**
+        - `cosine_min_value_wrong` (float): Minimum reward for incorrect answers.
+        - `cosine_max_value_wrong` (float): Maximum reward for incorrect answers.
+        - `cosine_min_value_correct` (float): Minimum reward for correct answers.
+        - `cosine_max_value_correct` (float): Maximum reward for correct answers.
+        - `cosine_max_len` (int): Maximum length for scaling.
+        - `accuracy_orm` (BaseRewardFunction, optional): Accuracy computation module.
 
-    Example:
-        >>> reward_fn = CosineScaledReward()
-        >>> rewards = reward_fn(["答案是42", "错误答案"], ["答案是42", "答案是43"])
-        >>> print(rewards)
+    **Example Usage**:
+        ```python
+        reward_fn = CosineScaledReward()
+        rewards = reward_fn(["答案是42", "错误答案"], ["答案是42", "答案是43"])
+        print(rewards)
+        ```
     """
 
     def __init__(
@@ -591,12 +617,26 @@ class CosineScaledReward(BaseRewardFunction):
         rewards = []
 
         for content, acc_reward in zip(completions, acc_rewards):
+            gen_text_len = len(
+                content.strip())  # Avoid counting excess whitespace
+
+            if gen_text_len == 0:
+                logger.warning(f'Skipping empty completion: {content}')
+                rewards.append(self.min_value_wrong
+                               )  # Assign minimum penalty for empty responses
+                continue
+
             is_correct = acc_reward >= 1.0
-            min_value = self.min_value_correct if is_correct else self.max_value_wrong
-            max_value = self.max_value_correct if is_correct else self.min_value_wrong
-            gen_text_len = len(content)
-            reward = cosine_scaled_reward(gen_text_len, self.max_len,
-                                          min_value, max_value)
+
+            # Correct answers get higher rewards for being concise
+            if is_correct:
+                min_value, max_value = self.min_value_correct, self.max_value_correct
+            else:
+                min_value, max_value = self.max_value_wrong, self.min_value_wrong  # Fixed logic
+
+            # Compute scaled reward
+            reward = self.cosine_scaled_reward(gen_text_len, self.max_len,
+                                               min_value, max_value)
             rewards.append(reward)
 
         return rewards
@@ -775,7 +815,7 @@ class CodeReward(BaseRewardFunction):
 
 relu_based_reward_func_mapping = {
     'accuracy_v1': MathAccuracyReward,
-    "accuracy_v2": MathAccuracyRewardV2,
+    'accuracy_v2': MathAccuracyRewardV2,
     'format': FormatReward,
     'react_format': ReActFormat,
     'tag_reward': TagCountReward,
@@ -855,28 +895,93 @@ def test_cosine_scaled_reward_behavior() -> None:
     logger.info('All tests passed successfully!')
 
 
-def demonstrate_rewards():
-    """演示不同情况下的奖励计算."""
+def test_rewards_func_exam1() -> None:
+    """Test the reward function with various math-related completion
+    examples."""
     reward_fn = CosineScaledReward()
 
-    # 测试用例
-    examples = [('so that x == 1 or x == 2, thus the result is $2*\pi*r$',
-                 '$2*\pi*r$'), ('The answer is $$\sin(x)$$', '$$\sin(x)$$'),
-                ('After solving, we get $1/2$', '$1/2$'),
-                ('The final result is $$(a + b)^2$$', '$(a + b)^2$'),
-                ('Therefore, $$3!$$', '$3!$'),
-                ('The point coordinates are $(1,2)$', '$(1,2)$')]
+    # Test cases: pairs of (generated answer, expected solution)
+    examples: List[Tuple[str, str]] = [
+        ('so that x == 1 or x == 2, thus the result is $2*\pi*r$',
+         '$2*\pi*r$'), ('The answer is $$\\sin(x)$$', '$$\\sin(x)$$'),
+        ('After solving, we get $1/2$', '$1/2$'),
+        ('The final result is $$(a + b)^2$$', '$(a + b)^2$'),
+        ('Therefore, $$3!$$', '$3!$'),
+        ('The point coordinates are $(1,2)$', '$(1,2)$')
+    ]
 
     completions, solutions = zip(*examples)
     rewards = reward_fn(list(completions), list(solutions))
 
-    logger.info('\n奖励值示例：')
+    logger.info('\nReward Examples:')
     for comp, solution, reward in zip(completions, solutions, rewards):
-        logger.info(
-            f'answer: {comp} || gold: {solution}, length: {len(comp)}, reward: {reward:.3f}\n',
-        )
+        logger.info(f'Answer: {comp}')
+        logger.info(f'Gold: {solution}')
+        logger.info(f'Length: {len(comp)}')
+        logger.info(f'Reward: {reward:.3f}\n')
+
+
+def test_rewards_func_exam2() -> None:
+    """Test the reward function with different mathematical reasoning examples.
+
+    Includes correct, incorrect, and partially correct responses.
+    """
+    examples = [
+        # ✅ 正确示例（包含推理步骤）
+        (r'首先，我们知道二次方程 $2x - 3 = 0$。\n'
+         r'移项得到 $2x = 3$。\n'
+         r'两边同时除以 2，得出 $x = \frac{3}{2}$。', r'x = \frac{3}{2}'),  # 完整推理 + 正确答案
+        (r'根据爱因斯坦的质能方程：\n'
+         r'$E = mc^2$。\n'
+         r'其中，$m$ 代表质量，$c$ 代表光速。', r'E = mc^2'),  # 物理公式 + 解释
+        (r'计算定积分 $\int_0^1 x^2 \,dx$。\n'
+         r'首先，计算不定积分：$\int x^2 \,dx = \frac{x^3}{3}$。\n'
+         r'然后代入上限 1 和下限 0，得到：\n'
+         r'$\frac{1^3}{3} - \frac{0^3}{3} = \frac{1}{3}$。',
+         r'\int_0^1 x^2 \,dx = \frac{1}{3}'),  # 清晰的积分推导
+
+        # ❌ 错误示例（包含推理错误）
+        (r'解方程 $2x - 3 = 0$。\n'
+         r'移项得到 $2x = 3$。\n'
+         r'然后两边同时除以 **3**，得出 $x = \frac{3}{3} = 1$。', r'x = \frac{3}{2}'
+         ),  # 计算错误（除错数）
+        (r'根据物理公式：$E = mc^3$。\n'
+         r'但实际上光速的指数应为 2，因此正确公式是 $E = mc^2$。', r'E = mc^2'),  # 公式错误
+        (r'计算定积分 $\int_0^1 x^2 \,dx$。\n'
+         r'计算不定积分：$\int x^2 \,dx = \frac{x^3}{3}$。\n'
+         r'然后代入上限 1 和下限 0，得到：\n'
+         r'$\frac{1^3}{2} - \frac{0^3}{2} = \frac{1}{2}$。',
+         r'\int_0^1 x^2 \,dx = \frac{1}{3}'),  # 积分结果错误
+
+        # 🔄 部分正确（推理清晰但格式问题或等价表达）
+        (r'解方程 $2x - 3 = 0$。\n'
+         r'移项得到 $2x = 3$。\n'
+         r'两边同时除以 2，得出 $x = 1.5$。', r'x = \frac{3}{2}'),  # 结果正确但不是 LaTeX 形式
+        (r'级数求和结果如下：\n'
+         r'$\frac{\pi^2}{6} = \sum_{n=1}^{\infty} \frac{1}{n^2}$。',
+         r'\sum_{n=1}^{\infty} \frac{1}{n^2} = \frac{\pi^2}{6}'),  # 数学等价但顺序不同
+        (r'计算定积分 $\int_0^1 x^2 \,dx$。\n'
+         r'计算不定积分：$\int x^2 \,dx = \frac{x^3}{3}$。\n'
+         r'然后代入上下限，得到 $x^3/3$ 的变化量。\n'
+         r'最终答案为 $\frac{2}{6}$。',
+         r'\int_0^1 x^2 \,dx = \frac{1}{3}'),  # 结果正确但未化简
+        (r'爱因斯坦公式 $E = c^2 m$ 适用于质量与能量的转换。', r'E = mc^2'),  # 变量顺序错误但等价
+    ]
+
+    reward_fn = CosineScaledReward(cosine_max_len=30)
+    reward_fn = MathAccuracyReward()
+    completions, solutions = zip(*examples)
+    rewards = reward_fn(list(completions), list(solutions))
+
+    logger.info('\nReward Examples:')
+    for comp, solution, reward in zip(completions, solutions, rewards):
+        logger.info(f'Answer: {comp}')
+        logger.info(f'Gold: {solution}')
+        logger.info(f'Length: {len(comp)}')
+        logger.info(f'Reward: {reward:.3f}\n')
 
 
 if __name__ == '__main__':
     test_cosine_scaled_reward_behavior()
-    demonstrate_rewards()
+    test_rewards_func_exam1()
+    test_rewards_func_exam2()
