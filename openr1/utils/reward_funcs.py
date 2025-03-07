@@ -774,7 +774,8 @@ class CodeReward(BaseRewardFunction):
 
 
 relu_based_reward_func_mapping = {
-    'accuracy': MathAccuracyReward,
+    'accuracy_v1': MathAccuracyReward,
+    "accuracy_v2": MathAccuracyRewardV2,
     'format': FormatReward,
     'react_format': ReActFormat,
     'tag_reward': TagCountReward,
