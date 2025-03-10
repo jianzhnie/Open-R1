@@ -546,7 +546,7 @@ class CosineScaledReward(BaseRewardFunction):
         cosine_min_value_correct: float = 0.5,
         cosine_max_value_correct: float = 1.0,
         cosine_max_len: int = 1000,
-        accuracy_orm: Union[BaseRewardFunction, None] = MathAccuracyReward
+        accuracy_orm: Union[BaseRewardFunction, None] = None,
     ) -> None:
 
         self.tokenizer = tokenizer
@@ -555,10 +555,7 @@ class CosineScaledReward(BaseRewardFunction):
         self.min_value_correct = cosine_min_value_correct
         self.max_value_correct = cosine_max_value_correct
         self.max_len = cosine_max_len
-        if isinstance(accuracy_orm, str):
-            self.accuracy_orm = relu_based_reward_func_mapping[accuracy_orm]
-        elif isinstance(accuracy_orm, BaseRewardFunction):
-            self.accuracy_orm = accuracy_orm
+        self.accuracy_orm = accuracy_orm or MathAccuracyReward()
 
     @staticmethod
     def cosine_scaled_reward(t: int, T: int, min_value: float,
